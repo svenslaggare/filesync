@@ -21,8 +21,8 @@ use crate::p2p::ClientId;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
-    RequestFileSync(u64),
-    AcceptedFileSync(u64),
+    RequestFileSync(u64, bool),
+    AcceptedFileSync(u64, bool),
     SyncFiles { files: Vec<(String, ModifiedTime)>, two_way: bool },
     GetFile(String),
     StartSyncFile { filename: String, request: FileRequest },
@@ -103,13 +103,13 @@ impl FileSyncManager {
                         commands_sender: &mut mpsc::UnboundedSender<SyncCommand>,
                         command: SyncCommand) -> tokio::io::Result<()> {
         match command {
-            SyncCommand::RequestFileSync(id) => {
+            SyncCommand::RequestFileSync(id, two_way) => {
                 if self.files_sync_status.lock().unwrap().is_empty() {
-                    commands_sender.send(SyncCommand::AcceptedFileSync(id))
+                    commands_sender.send(SyncCommand::AcceptedFileSync(id, two_way))
                         .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 }
             }
-            SyncCommand::AcceptedFileSync(id) => {
+            SyncCommand::AcceptedFileSync(id, two_way) => {
                 println!("Got sync request id #{}", id);
 
                 let sync = {
@@ -127,7 +127,7 @@ impl FileSyncManager {
                             .iter()
                             .map(|file| (file.path.to_str().unwrap().to_owned(), file.modified))
                             .collect::<Vec<_>>(),
-                        two_way: false
+                        two_way
                     }).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
 
                     self.next_sync();
@@ -246,10 +246,12 @@ impl FileSyncManager {
         Ok(())
     }
 
-    pub fn request_sync(&self, commands_sender: &mut mpsc::UnboundedSender<SyncCommand>) -> tokio::io::Result<()> {
+    pub fn request_sync(&self,
+                        two_way: bool,
+                        commands_sender: &mut mpsc::UnboundedSender<SyncCommand>) -> tokio::io::Result<()> {
         let sync_id = self.next_sync_request_id.load(Ordering::SeqCst);
         println!("Sending sync request #{}", sync_id);
-        commands_sender.send(SyncCommand::RequestFileSync(sync_id))
+        commands_sender.send(SyncCommand::RequestFileSync(sync_id, two_way))
             .map_err(|_| tokio::io::Error::from(ErrorKind::Other))
     }
 
@@ -397,7 +399,7 @@ pub async fn run_sync_client(command_handler: Arc<FileSyncManager>,
     });
 
     if initial_sync {
-        command_handler.request_sync(&mut commands_sender)?;
+        command_handler.request_sync(false, &mut commands_sender)?;
     }
 
     loop {
