@@ -9,14 +9,65 @@ use serde::{Deserialize, Serialize};
 
 use crate::filesync::{SyncCommand};
 
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Ord, Eq, Serialize, Deserialize, Hash)]
+pub struct ModifiedTime {
+    seconds: u64,
+    microseconds: u64
+}
+
+impl ModifiedTime {
+    pub fn from_unix_seconds(time: f64) -> ModifiedTime {
+        ModifiedTime {
+            seconds: time as u64,
+            microseconds: ((time - time.floor()) * 1.0E6) as u64
+        }
+    }
+
+    pub fn from_system_time(time: std::time::SystemTime) -> ModifiedTime {
+       let duration = time.duration_since(std::time::UNIX_EPOCH).unwrap();
+        ModifiedTime {
+            seconds: duration.as_secs() as u64,
+            microseconds: duration.subsec_micros() as u64
+        }
+    }
+
+    pub fn seconds(&self) -> u64 {
+        self.seconds
+    }
+
+    pub fn microseconds(&self) -> u64 {
+        self.microseconds
+    }
+
+    pub fn to_unix_seconds(&self) -> f64 {
+        self.seconds as f64 + self.microseconds as f64 / 1.0E6
+    }
+
+    pub fn is_newer(&self, other: &ModifiedTime) -> bool {
+        if self.seconds > other.seconds {
+            return true;
+        } else if self.seconds == other.seconds {
+            return self.microseconds > other.microseconds;
+        }
+
+        return false;
+    }
+}
+
+impl std::fmt::Display for ModifiedTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_unix_seconds())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct File {
     pub path: PathBuf,
-    pub modified: f64
+    pub modified: ModifiedTime
 }
 
 impl File {
-    pub fn new(path: PathBuf, modified: f64) -> File {
+    pub fn new(path: PathBuf, modified: ModifiedTime) -> File {
         File {
             path,
             modified
@@ -41,7 +92,7 @@ pub async fn list_files(folder: &Path) -> tokio::io::Result<Vec<File>> {
                 let metadata = entry.metadata().await?;
 
                 let modified = metadata.modified().unwrap();
-                let modified = modified.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                let modified = ModifiedTime::from_system_time(modified);
 
                 files.push(File::new(path, modified));
             }
@@ -66,13 +117,13 @@ impl FileBlock {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileRequest {
     pub size: u64,
-    pub modified: f64,
+    pub modified: ModifiedTime,
     pub block_size: u64,
     pub num_blocks: u64
 }
 
 impl FileRequest {
-    pub fn new(size: u64, modified: f64, block_size: u64) -> FileRequest {
+    pub fn new(size: u64, modified: ModifiedTime, block_size: u64) -> FileRequest {
         let num_blocks = (size + block_size - 1) / block_size;
 
         FileRequest {
@@ -97,7 +148,7 @@ pub async fn start_file_sync(folder: &Path, filename: String) -> tokio::io::Resu
     let file_metadata = tokio::fs::metadata(&path).await?;
     let file_request = FileRequest::new(
         file_metadata.len(),
-        file_metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(),
+        ModifiedTime::from_system_time(file_metadata.modified().unwrap()),
         32 * 1024
     );
 
@@ -140,7 +191,7 @@ pub async fn send_file_block(folder: &Path,
 
 pub async fn write_file_block(path: &Path,
                               file_block: &FileBlock,
-                              modified: f64,
+                              modified: ModifiedTime,
                               content: &[u8]) -> tokio::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -158,10 +209,10 @@ pub async fn write_file_block(path: &Path,
     file.write_all(content).await?;
     file.flush().await?;
 
-    utime::set_file_times(
+    utime(
         &path,
-        modified as i64,
-        modified as i64
+        &modified,
+        &modified
     ).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
 
     Ok(())
@@ -172,4 +223,31 @@ pub fn hash_file_block(offset: u64, content: &[u8]) -> String {
     hasher.input(&offset.to_le_bytes());
     hasher.input(content);
     hasher.result_str()
+}
+
+fn utime<P: AsRef<Path>>(path: P, atime: &ModifiedTime, mtime: &ModifiedTime) -> std::io::Result<()> {
+    use libc::{c_char, c_int, time_t, timeval, suseconds_t};
+    use std::ffi::CString;
+    use std::os::unix::prelude::*;
+    extern "C" {
+        fn utimes(name: *const c_char, times: *const timeval) -> c_int;
+    }
+
+    let path = CString::new(path.as_ref().as_os_str().as_bytes())?;
+    let atime = timeval {
+        tv_sec: atime.seconds() as time_t,
+        tv_usec: atime.microseconds() as suseconds_t,
+    };
+    let mtime = timeval {
+        tv_sec: mtime.seconds() as time_t,
+        tv_usec: mtime.microseconds() as suseconds_t,
+    };
+    let times = [atime, mtime];
+
+    let ret = unsafe { utimes(path.as_ptr(), times.as_ptr()) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }

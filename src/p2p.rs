@@ -182,12 +182,9 @@ pub async fn run_client(tracker_address: SocketAddr,
         match command {
             P2PCommand::Connect(_) => { eprintln!("Unexpected."); }
             P2PCommand::ConnectionInfo { id: _, clients } => {
-                let mut sync = true;
                 for client in clients {
-                    if let Err(err) = start_sync_client(client, file_sync_manager.clone(), sync).await {
+                    if let Err(err) = start_sync_client(client, file_sync_manager.clone(), true).await {
                         println!("Sync client error: {:?}", err);
-                    } else {
-                        sync = false;
                     }
                 }
             }
@@ -216,7 +213,8 @@ async fn start_sync_server(file_sync_manager: Arc<FileSyncManager>) -> SocketAdd
                 tokio::spawn(async move {
                     if let Err(result) = filesync::run_sync_client(file_sync_manager_clone,
                                                                    sync_client,
-                                                                   mpsc::unbounded_channel()).await {
+                                                                   mpsc::unbounded_channel(),
+                                                                   false).await {
                         println!("Sync client error: {:?}", result);
                     }
                 });
@@ -232,22 +230,15 @@ async fn start_sync_server(file_sync_manager: Arc<FileSyncManager>) -> SocketAdd
 async fn start_sync_client(client: P2PClient,
                            file_sync_manager: Arc<FileSyncManager>,
                            sync: bool) -> tokio::io::Result<()> {
-    let mut sync_client = TcpStream::connect(client.address).await?;
+    let sync_client = TcpStream::connect(client.address).await?;
 
     tokio::spawn(async move {
-        if sync {
-            if let Err(result) = filesync::sync_files(&mut sync_client,
-                                                      client.address,
-                                                      &file_sync_manager.folder,
-                                                      false).await {
-                println!("Sync client error: {:?}", result);
-                return;
-            }
-        }
-
         let commands_channel = mpsc::unbounded_channel::<SyncCommand>();
         file_sync_manager.add_client(client.id, commands_channel.0.clone());
-        if let Err(result) = filesync::run_sync_client(file_sync_manager, sync_client, commands_channel).await {
+        if let Err(result) = filesync::run_sync_client(file_sync_manager,
+                                                       sync_client,
+                                                       commands_channel,
+                                                       sync).await {
             println!("Sync client error: {:?}", result);
         }
     });

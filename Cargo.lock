@@ -46,6 +46,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "futures",
+ "libc",
  "rand 0.8.0",
  "rust-crypto",
  "serde",

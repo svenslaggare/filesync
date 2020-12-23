@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Mutex, Arc};
 use std::iter::FromIterator;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering, AtomicU64};
 
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
@@ -14,14 +14,16 @@ use tokio::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::files::{FileBlock, File, FileRequest, hash_file_block};
+use crate::files::{FileBlock, File, FileRequest, hash_file_block, ModifiedTime};
 use crate::{files, sync};
 use crate::sync::{SyncAction, FileChangesFinder};
 use crate::p2p::ClientId;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
-    SyncFiles { files: Vec<(String, f64)>, two_way: bool },
+    RequestFileSync(u64),
+    AcceptedFileSync(u64),
+    SyncFiles { files: Vec<(String, ModifiedTime)>, two_way: bool },
     GetFile(String),
     StartSyncFile { filename: String, request: FileRequest },
     GetFileBlock { filename: String, block: FileBlock },
@@ -77,7 +79,9 @@ pub struct FileSyncManager {
     clients_commands_sender: Mutex<HashMap<ClientId, mpsc::UnboundedSender<SyncCommand>>>,
     file_changes_finder: Mutex<FileChangesFinder>,
     request_file_block_queue: Mutex<VecDeque<(mpsc::UnboundedSender<SyncCommand>, SyncCommand)>>,
-    num_active_file_block_requests: AtomicI64
+    num_active_file_block_requests: AtomicI64,
+    next_sync_request_id: AtomicU64,
+    sync_requests: Mutex<HashSet<u64>>
 }
 
 impl FileSyncManager {
@@ -88,14 +92,47 @@ impl FileSyncManager {
             clients_commands_sender: Mutex::new(HashMap::new()),
             file_changes_finder: Mutex::new(FileChangesFinder::new()),
             request_file_block_queue: Mutex::new(VecDeque::new()),
-            num_active_file_block_requests: AtomicI64::new(0)
+            num_active_file_block_requests: AtomicI64::new(0),
+            next_sync_request_id: AtomicU64::new(1),
+            sync_requests: Mutex::new(HashSet::new())
         }
     }
 
     pub async fn handle(&self,
+                        destination_address: SocketAddr,
                         commands_sender: &mut mpsc::UnboundedSender<SyncCommand>,
                         command: SyncCommand) -> tokio::io::Result<()> {
         match command {
+            SyncCommand::RequestFileSync(id) => {
+                if self.files_sync_status.lock().unwrap().is_empty() {
+                    commands_sender.send(SyncCommand::AcceptedFileSync(id))
+                        .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                }
+            }
+            SyncCommand::AcceptedFileSync(id) => {
+                println!("Got sync request id #{}", id);
+
+                let sync = {
+                    let mut sync_requests_guard = self.sync_requests.lock().unwrap();
+                    sync_requests_guard.insert(id)
+                };
+
+                if sync {
+                    println!("Requesting sync of files with {}.", destination_address);
+
+                    let files = files::list_files(&self.folder).await?;
+
+                    commands_sender.send(SyncCommand::SyncFiles {
+                        files: files
+                            .iter()
+                            .map(|file| (file.path.to_str().unwrap().to_owned(), file.modified))
+                            .collect::<Vec<_>>(),
+                        two_way: false
+                    }).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+
+                    self.next_sync();
+                }
+            }
             SyncCommand::SyncFiles { files: other_files, two_way } => {
                 println!("Syncing files...");
 
@@ -131,17 +168,27 @@ impl FileSyncManager {
                 ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
             }
             SyncCommand::StartSyncFile { filename, request } => {
-                println!("Starting sync of file: {} ({} bytes)", filename, request.size);
+                let is_newer = tokio::fs::metadata(self.folder.join(&filename)).await.map(|metadata| {
+                    let modified = metadata.modified().unwrap();
+                    let modified = ModifiedTime::from_system_time(modified);
+                    request.modified.is_newer(&modified)
+                }).unwrap_or(true);
 
-                let mut request_file_block_queue_guard = self.request_file_block_queue.lock().unwrap();
-                for block in self.start_sync(&filename, request).file_blocks() {
-                    request_file_block_queue_guard.push_back((
-                        commands_sender.clone(),
-                        SyncCommand::GetFileBlock {
-                            filename: filename.clone(),
-                            block,
-                        }
-                    ));
+                if is_newer {
+                    println!("Starting sync of file: {} ({} bytes)", filename, request.size);
+
+                    let mut request_file_block_queue_guard = self.request_file_block_queue.lock().unwrap();
+                    for block in self.start_file_sync(&filename, request).file_blocks() {
+                        request_file_block_queue_guard.push_back((
+                            commands_sender.clone(),
+                            SyncCommand::GetFileBlock {
+                                filename: filename.clone(),
+                                block,
+                            }
+                        ));
+                    }
+                } else {
+                    println!("Sync request {} is older than what we have.", filename);
                 }
             }
             SyncCommand::GetFileBlock { filename, block } => {
@@ -170,7 +217,7 @@ impl FileSyncManager {
                         ).await?;
 
                         self.received_file_block(&filename, &block, content.len());
-                        self.try_complete_sync(&filename, modified).await?;
+                        self.try_complete_file_sync(&filename, modified).await?;
                     }
                 } else {
                     println!(
@@ -197,6 +244,17 @@ impl FileSyncManager {
         self.dispatch_file_block_requests();
 
         Ok(())
+    }
+
+    pub fn request_sync(&self, commands_sender: &mut mpsc::UnboundedSender<SyncCommand>) -> tokio::io::Result<()> {
+        let sync_id = self.next_sync_request_id.load(Ordering::SeqCst);
+        println!("Sending sync request #{}", sync_id);
+        commands_sender.send(SyncCommand::RequestFileSync(sync_id))
+            .map_err(|_| tokio::io::Error::from(ErrorKind::Other))
+    }
+
+    pub fn next_sync(&self) {
+        self.next_sync_request_id.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn start_background_tasks(self: &Arc<FileSyncManager>) {
@@ -257,7 +315,7 @@ impl FileSyncManager {
         }
     }
 
-    pub fn start_sync(&self, filename: &str, request: FileRequest) -> FileRequest {
+    pub fn start_file_sync(&self, filename: &str, request: FileRequest) -> FileRequest {
         let mut files_sync_status_guard = self.files_sync_status.lock().unwrap();
         files_sync_status_guard.insert(
             filename.to_owned(),
@@ -285,10 +343,10 @@ impl FileSyncManager {
         }
     }
 
-    async fn try_complete_sync(&self, filename: &str, modified: f64) -> tokio::io::Result<()> {
+    async fn try_complete_file_sync(&self, filename: &str, modified: ModifiedTime) -> tokio::io::Result<()> {
         if self.files_sync_status.lock().unwrap().get(filename).map(|file| file.is_done()).unwrap_or(false) {
             let tmp_write_path = self.files_sync_status.lock().unwrap()[filename].tmp_write_path.clone();
-            self.file_changes_finder.lock().unwrap().add_external(PathBuf::from(filename), modified as u64);
+            self.file_changes_finder.lock().unwrap().add_external(PathBuf::from(filename), modified);
 
             let path = self.folder.join(filename);
             if let Some(parent) = path.parent() {
@@ -324,8 +382,10 @@ impl FileSyncManager {
 pub async fn run_sync_client(command_handler: Arc<FileSyncManager>,
                              client: TcpStream,
                              commands_channel: (mpsc::UnboundedSender<SyncCommand>,
-                                                mpsc::UnboundedReceiver<SyncCommand>)) -> tokio::io::Result<()> {
+                                                mpsc::UnboundedReceiver<SyncCommand>),
+                             initial_sync: bool) -> tokio::io::Result<()> {
     let (mut commands_sender, mut commands_receiver) = commands_channel;
+    let destination_address = client.peer_addr().unwrap();
     let (mut client_reader, mut client_writer) = client.into_split();
 
     tokio::spawn(async move {
@@ -336,31 +396,18 @@ pub async fn run_sync_client(command_handler: Arc<FileSyncManager>,
         }
     });
 
+    if initial_sync {
+        command_handler.request_sync(&mut commands_sender)?;
+    }
+
     loop {
         let command = SyncCommand::receive_command(&mut client_reader).await?;
         command_handler.handle(
+            destination_address,
             &mut commands_sender,
             command
         ).await?;
     }
-}
-
-pub async fn sync_files<T: AsyncWriteExt + Unpin>(destination: &mut T,
-                                                  destination_address: SocketAddr,
-                                                  folder: &Path,
-                                                  two_way: bool) -> tokio::io::Result<()> {
-    println!("Requesting sync of files with {}.", destination_address);
-    let files = files::list_files(&folder).await?;
-
-    SyncCommand::SyncFiles {
-        files: files
-            .iter()
-            .map(|file| (file.path.to_str().unwrap().to_owned(), file.modified))
-            .collect::<Vec<_>>(),
-        two_way
-    }.send_command(destination).await?;
-
-    Ok(())
 }
 
 async fn list_files_as_map(folder: &Path) -> HashMap<PathBuf, File> {

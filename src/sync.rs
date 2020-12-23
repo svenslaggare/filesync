@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::iter::FromIterator;
 
-use crate::files::File;
+use crate::files::{File, ModifiedTime};
 
 pub enum SyncAction {
     GetFile(String),
@@ -21,7 +21,7 @@ pub fn compute_sync_actions(files: Vec<File>, other_files: Vec<File>, two_way: b
                                send: bool| {
         for file1 in files1 {
             let sync_file = if let Some(file2) = files2.get(&file1.path) {
-                file1.modified as u64 > file2.modified as u64
+                file1.modified.is_newer(&file2.modified)
             } else {
                 true
             };
@@ -66,7 +66,7 @@ pub struct FileChanges {
 }
 
 pub struct FileChangesFinder {
-    external_modifies: HashSet<(PathBuf, u64)>,
+    external_modifies: HashSet<(PathBuf, ModifiedTime)>,
     external_deletes: HashSet<PathBuf>,
     last_files: HashMap<PathBuf, File>
 }
@@ -80,7 +80,7 @@ impl FileChangesFinder {
         }
     }
 
-    pub fn add_external(&mut self, path: PathBuf, modified: u64) {
+    pub fn add_external(&mut self, path: PathBuf, modified: ModifiedTime) {
         self.external_modifies.insert((path, modified));
     }
 
@@ -97,7 +97,7 @@ impl FileChangesFinder {
 
         for new_file in new_files.values() {
             let file_change = if let Some(old_file) = self.last_files.get(&new_file.path) {
-                if new_file.modified as u64 > old_file.modified as u64 {
+                if new_file.modified.is_newer(&old_file.modified) {
                     Some(new_file.clone())
                 } else {
                     None
@@ -107,7 +107,7 @@ impl FileChangesFinder {
             };
 
             if let Some(file_change) = file_change {
-                if !self.external_modifies.remove(&(file_change.path.clone(), file_change.modified as u64)) {
+                if !self.external_modifies.remove(&(file_change.path.clone(), file_change.modified)) {
                     modified_files.push(file_change);
                 }
             }
