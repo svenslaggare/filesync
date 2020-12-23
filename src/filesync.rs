@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::files::{FileBlock, File, FileRequest, hash_file_block, ModifiedTime};
 use crate::{files, sync};
 use crate::sync::{SyncAction, FileChangesFinder};
-use crate::p2p::ClientId;
+use crate::tracker::ClientId;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
@@ -381,7 +381,7 @@ impl FileSyncManager {
     }
 }
 
-pub async fn run_sync_client(command_handler: Arc<FileSyncManager>,
+pub async fn run_sync_client(file_sync_manager: Arc<FileSyncManager>,
                              client: TcpStream,
                              commands_channel: (mpsc::UnboundedSender<SyncCommand>,
                                                 mpsc::UnboundedReceiver<SyncCommand>),
@@ -399,12 +399,12 @@ pub async fn run_sync_client(command_handler: Arc<FileSyncManager>,
     });
 
     if initial_sync {
-        command_handler.request_sync(false, &mut commands_sender)?;
+        file_sync_manager.request_sync(false, &mut commands_sender)?;
     }
 
     loop {
         let command = SyncCommand::receive_command(&mut client_reader).await?;
-        command_handler.handle(
+        file_sync_manager.handle(
             destination_address,
             &mut commands_sender,
             command

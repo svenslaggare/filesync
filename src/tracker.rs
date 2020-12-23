@@ -29,21 +29,21 @@ impl std::fmt::Debug for ClientId {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct P2PClient {
+pub struct TrackerClient {
     pub id: ClientId,
     pub address: SocketAddr
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum P2PCommand {
+pub enum TrackerCommand {
     Connect(SocketAddr),
-    ConnectionInfo { id: ClientId, clients: Vec<P2PClient> },
-    ClientConnected(P2PClient),
+    ConnectionInfo { id: ClientId, clients: Vec<TrackerClient> },
+    ClientConnected(TrackerClient),
     ClientDisconnected(ClientId)
 }
 
-impl P2PCommand {
-    pub async fn receive_command<T: AsyncReadExt + Unpin>(socket: &mut T) -> tokio::io::Result<P2PCommand> {
+impl TrackerCommand {
+    pub async fn receive_command<T: AsyncReadExt + Unpin>(socket: &mut T) -> tokio::io::Result<TrackerCommand> {
         let num_bytes = socket.read_u64().await? as usize;
         let mut command_bytes = vec![0; num_bytes];
         socket.read_exact(&mut command_bytes[..]).await?;
@@ -58,19 +58,19 @@ impl P2PCommand {
     }
 }
 
-pub struct P2PManagerClient {
-    client: P2PClient,
-    command_sender: mpsc::UnboundedSender<P2PCommand>
+pub struct TrackerManagerClient {
+    client: TrackerClient,
+    command_sender: mpsc::UnboundedSender<TrackerCommand>
 }
 
-pub struct P2PManager {
+pub struct TrackerManager {
     next_client_id: u64,
-    clients: HashMap<ClientId, P2PManagerClient>
+    clients: HashMap<ClientId, TrackerManagerClient>
 }
 
-impl P2PManager {
-    pub fn new() -> P2PManager {
-        P2PManager {
+impl TrackerManager {
+    pub fn new() -> TrackerManager {
+        TrackerManager {
             next_client_id: 1,
             clients: HashMap::new()
         }
@@ -78,14 +78,14 @@ impl P2PManager {
 
     pub fn new_client(&mut self,
                       address: SocketAddr,
-                      command_sender: mpsc::UnboundedSender<P2PCommand>) -> ClientId {
+                      command_sender: mpsc::UnboundedSender<TrackerCommand>) -> ClientId {
         let client_id = ClientId(self.next_client_id);
         self.next_client_id += 1;
         println!("{} = #{}", address, client_id);
         self.clients.insert(
             client_id,
-            P2PManagerClient {
-                client: P2PClient {
+            TrackerManagerClient {
+                client: TrackerClient {
                     id: client_id,
                     address,
                 },
@@ -97,7 +97,7 @@ impl P2PManager {
         for client in self.clients.values() {
             if client.client.id != new_client.id {
                 #[allow(unused_must_use)] {
-                    client.command_sender.send(P2PCommand::ClientConnected(new_client.clone()));
+                    client.command_sender.send(TrackerCommand::ClientConnected(new_client.clone()));
                 }
             }
         }
@@ -111,21 +111,21 @@ impl P2PManager {
 
         for client in self.clients.values() {
             #[allow(unused_must_use)] {
-                client.command_sender.send(P2PCommand::ClientDisconnected(id));
+                client.command_sender.send(TrackerCommand::ClientDisconnected(id));
             }
         }
     }
 
-    pub fn clients(&self) -> impl Iterator<Item=&P2PClient> {
+    pub fn clients(&self) -> impl Iterator<Item=&TrackerClient> {
         self.clients.values().map(|client| &client.client)
     }
 }
 
-pub async fn handle_manager_client(p2p_manager: Arc<Mutex<P2PManager>>,
+pub async fn handle_manager_client(tracker_manager: Arc<Mutex<TrackerManager>>,
                                    client: TcpStream,
                                    client_id_ref: Arc<AtomicU64>) -> tokio::io::Result<()> {
     let (mut client_reader, mut client_writer) = client.into_split();
-    let (command_sender, mut command_receiver) = mpsc::unbounded_channel::<P2PCommand>();
+    let (command_sender, mut command_receiver) = mpsc::unbounded_channel::<TrackerCommand>();
 
     tokio::spawn(async move {
         while let Some(command) = command_receiver.recv().await {
@@ -136,15 +136,15 @@ pub async fn handle_manager_client(p2p_manager: Arc<Mutex<P2PManager>>,
     });
 
     loop {
-        match P2PCommand::receive_command(&mut client_reader).await? {
-            P2PCommand::Connect(address) => {
+        match TrackerCommand::receive_command(&mut client_reader).await? {
+            TrackerCommand::Connect(address) => {
                 let (client_id, clients) = {
-                    let mut p2p_manager_guard = p2p_manager.lock().unwrap();
+                    let mut tracker_manager_guard = tracker_manager.lock().unwrap();
 
-                    let client_id = p2p_manager_guard.new_client(address, command_sender.clone());
+                    let client_id = tracker_manager_guard.new_client(address, command_sender.clone());
                     client_id_ref.store(client_id.0, Ordering::SeqCst);
 
-                    let clients = p2p_manager_guard
+                    let clients = tracker_manager_guard
                         .clients()
                         .filter(|client| client.id != client_id)
                         .cloned()
@@ -153,14 +153,14 @@ pub async fn handle_manager_client(p2p_manager: Arc<Mutex<P2PManager>>,
                     (client_id, clients)
                 };
 
-                command_sender.send(P2PCommand::ConnectionInfo {
+                command_sender.send(TrackerCommand::ConnectionInfo {
                     id: client_id,
                     clients
                 }).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
             }
-            P2PCommand::ConnectionInfo { .. } => { eprintln!("Unexpected."); }
-            P2PCommand::ClientConnected(_) => { eprintln!("Unexpected."); }
-            P2PCommand::ClientDisconnected(_) => { eprintln!("Unexpected."); }
+            TrackerCommand::ConnectionInfo { .. } => { eprintln!("Unexpected."); }
+            TrackerCommand::ClientConnected(_) => { eprintln!("Unexpected."); }
+            TrackerCommand::ClientDisconnected(_) => { eprintln!("Unexpected."); }
         }
     }
 }
@@ -171,29 +171,29 @@ pub async fn run_client(tracker_address: SocketAddr,
 
     let file_sync_manager = Arc::new(FileSyncManager::new(folder));
     let sync_listener_addr = start_sync_server(file_sync_manager.clone()).await;
-    P2PCommand::Connect(sync_listener_addr).send_command(&mut tracker_client).await?;
+    TrackerCommand::Connect(sync_listener_addr).send_command(&mut tracker_client).await?;
 
     file_sync_manager.start_background_tasks();
 
     loop {
-        let command = P2PCommand::receive_command(&mut tracker_client).await?;
+        let command = TrackerCommand::receive_command(&mut tracker_client).await?;
         println!("{:#?}", command);
 
         match command {
-            P2PCommand::Connect(_) => { eprintln!("Unexpected."); }
-            P2PCommand::ConnectionInfo { id: _, clients } => {
+            TrackerCommand::Connect(_) => { eprintln!("Unexpected."); }
+            TrackerCommand::ConnectionInfo { id: _, clients } => {
                 for client in clients {
                     if let Err(err) = start_sync_client(client, file_sync_manager.clone(), true).await {
                         println!("Sync client error: {:?}", err);
                     }
                 }
             }
-            P2PCommand::ClientConnected(client) => {
+            TrackerCommand::ClientConnected(client) => {
                 if let Err(err) = start_sync_client(client, file_sync_manager.clone(), false).await {
                     println!("Sync client error: {:?}", err);
                 }
             }
-            P2PCommand::ClientDisconnected(client_id) => {
+            TrackerCommand::ClientDisconnected(client_id) => {
                 file_sync_manager.remove_client(client_id);
             }
         }
@@ -227,7 +227,7 @@ async fn start_sync_server(file_sync_manager: Arc<FileSyncManager>) -> SocketAdd
     sync_listener_addr
 }
 
-async fn start_sync_client(client: P2PClient,
+async fn start_sync_client(client: TrackerClient,
                            file_sync_manager: Arc<FileSyncManager>,
                            sync: bool) -> tokio::io::Result<()> {
     let sync_client = TcpStream::connect(client.address).await?;

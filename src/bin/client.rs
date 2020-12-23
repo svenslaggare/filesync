@@ -2,7 +2,7 @@ use std::path::{PathBuf};
 use std::str::FromStr;
 use std::net::{SocketAddr, SocketAddrV4};
 
-use filesync::p2p;
+use filesync::tracker;
 
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
@@ -10,7 +10,7 @@ async fn main() -> tokio::io::Result<()> {
     println!("{}", folder.to_str().unwrap());
 
     let tracker_address = SocketAddr::from(SocketAddrV4::from_str("127.0.0.1:8080").unwrap());
-    p2p::run_client(tracker_address, folder).await?;
+    tracker::run_client(tracker_address, folder).await?;
 
     Ok(())
 }
