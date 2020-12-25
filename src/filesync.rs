@@ -5,8 +5,7 @@ use std::sync::{Mutex, Arc};
 use std::iter::FromIterator;
 use std::sync::atomic::{AtomicI64, Ordering, AtomicU64};
 
-use rand::{thread_rng, Rng};
-use rand::distributions::Alphanumeric;
+use rand::{thread_rng};
 use rand::seq::SliceRandom;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
@@ -19,6 +18,7 @@ use crate::files::{FileBlock, File, FileRequest, hash_file_block, ModifiedTime};
 use crate::{files, sync};
 use crate::sync::{SyncAction, FileChangesFinder};
 use crate::tracker::ClientId;
+use crate::sync_status::FilesSyncStatus;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
@@ -53,37 +53,9 @@ impl SyncCommand {
 pub type SyncCommandsSender = mpsc::UnboundedSender<SyncCommand>;
 pub type SyncCommandsReceiver = mpsc::UnboundedReceiver<SyncCommand>;
 
-struct FileSyncStatus {
-    tmp_write_path: PathBuf,
-    request: FileRequest,
-    done_blocks: HashSet<u64>,
-    redistribute: bool
-}
-
-impl FileSyncStatus {
-    pub fn new(folder: &Path, request: FileRequest, redistribute: bool) -> FileSyncStatus {
-        let tmp_filename: String = thread_rng()
-            .sample_iter(&Alphanumeric)
-            .map(char::from)
-            .take(20)
-            .collect();
-
-        FileSyncStatus {
-            tmp_write_path: folder.join(".filesync").join(&tmp_filename),
-            request,
-            done_blocks: HashSet::new(),
-            redistribute
-        }
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.done_blocks.len() as u64 == self.request.num_blocks
-    }
-}
-
 pub struct FileSyncManager {
     pub folder: PathBuf,
-    files_sync_status: Mutex<HashMap<String, FileSyncStatus>>,
+    files_sync_status: Mutex<FilesSyncStatus>,
     clients_commands_sender: Mutex<HashMap<ClientId, SyncCommandsSender>>,
     file_changes_finder: Mutex<FileChangesFinder>,
     request_file_block_queue: Mutex<VecDeque<(SyncCommandsSender, SyncCommand)>>,
@@ -96,7 +68,7 @@ impl FileSyncManager {
     pub fn new(folder: PathBuf) -> FileSyncManager {
         FileSyncManager {
             folder,
-            files_sync_status: Mutex::new(HashMap::new()),
+            files_sync_status: Mutex::new(FilesSyncStatus::new()),
             clients_commands_sender: Mutex::new(HashMap::new()),
             file_changes_finder: Mutex::new(FileChangesFinder::new()),
             request_file_block_queue: Mutex::new(VecDeque::new()),
@@ -142,7 +114,7 @@ impl FileSyncManager {
                         command: SyncCommand) -> tokio::io::Result<()> {
         match command {
             SyncCommand::RequestFileSync(id, two_way) => {
-                if self.files_sync_status.lock().unwrap().is_empty() {
+                if !self.files_sync_status.lock().unwrap().any_active() {
                     commands_sender.send(SyncCommand::AcceptedFileSync(id, two_way))
                         .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 } else {
@@ -186,7 +158,7 @@ impl FileSyncManager {
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
                         SyncAction::SendFile(filename, modified) => {
-                            println!("Start sending file: {}", filename);
+                            println!("Sending file: {}", filename);
                             commands_sender.send(SyncCommand::SendFile(filename, modified))
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
@@ -218,8 +190,8 @@ impl FileSyncManager {
                 self.get_file_from_random(filename, modified)?;
             },
             SyncCommand::StartSyncFile { filename, request, redistribute } => {
-                if files::remote_is_newer(&self.folder.join(&filename), &request.modified).await {
-                    if !self.files_sync_status.lock().unwrap().contains_key(&filename) {
+                if files::is_remote_newer(&self.folder.join(&filename), &request.modified).await {
+                    if !self.files_sync_status.lock().unwrap().is_syncing(&filename) {
                         let mut request_file_block_queue_guard = self.request_file_block_queue.lock().unwrap();
 
                         println!(
@@ -256,12 +228,7 @@ impl FileSyncManager {
                 let actual_hash = hash_file_block(block.offset(), &content);
 
                 if actual_hash == hash {
-                    let result = self.files_sync_status.lock().unwrap()
-                        .get(&filename)
-                        .map(|file_sync_status| {
-                            (file_sync_status.tmp_write_path.clone(), file_sync_status.request.modified)
-                        });
-
+                    let result = self.files_sync_status.lock().unwrap().get_tmp_write_path(&filename);
                     if let Some((tmp_path, modified)) = result {
                         files::write_file_block(
                             &tmp_path,
@@ -302,19 +269,6 @@ impl FileSyncManager {
         Ok(())
     }
 
-    pub fn request_sync(&self,
-                        two_way: bool,
-                        commands_sender: &mut SyncCommandsSender) -> tokio::io::Result<()> {
-        let sync_id = self.next_sync_request_id.load(Ordering::SeqCst);
-        println!("Sending sync request #{}", sync_id);
-        commands_sender.send(SyncCommand::RequestFileSync(sync_id, two_way))
-            .map_err(|_| tokio::io::Error::from(ErrorKind::Other))
-    }
-
-    pub fn next_sync(&self) {
-        self.next_sync_request_id.fetch_add(1, Ordering::SeqCst);
-    }
-
     pub fn start_background_tasks(self: &Arc<FileSyncManager>) {
         let file_sync_manager = self.clone();
         tokio::spawn(async move {
@@ -330,6 +284,19 @@ impl FileSyncManager {
                 file_sync_manager.dispatch_file_block_requests();
             }
         });
+    }
+
+    fn request_sync(&self,
+                        two_way: bool,
+                        commands_sender: &mut SyncCommandsSender) -> tokio::io::Result<()> {
+        let sync_id = self.next_sync_request_id.load(Ordering::SeqCst);
+        println!("Sending sync request #{}", sync_id);
+        commands_sender.send(SyncCommand::RequestFileSync(sync_id, two_way))
+            .map_err(|_| tokio::io::Error::from(ErrorKind::Other))
+    }
+
+    fn next_sync(&self) {
+        self.next_sync_request_id.fetch_add(1, Ordering::SeqCst);
     }
 
     fn dispatch_file_block_requests(&self) {
@@ -372,13 +339,7 @@ impl FileSyncManager {
     }
 
     pub fn start_file_sync(&self, filename: &str, request: FileRequest, redistribute: bool) -> FileRequest {
-        let mut files_sync_status_guard = self.files_sync_status.lock().unwrap();
-        files_sync_status_guard.insert(
-            filename.to_owned(),
-            FileSyncStatus::new(&self.folder, request, redistribute)
-        );
-
-        files_sync_status_guard[filename].request.clone()
+        self.files_sync_status.lock().unwrap().add(&self.folder, filename, request, redistribute)
     }
 
     fn received_file_block(&self, filename: &str, block: &FileBlock, content_size: usize) {
@@ -400,8 +361,8 @@ impl FileSyncManager {
     }
 
     async fn try_complete_file_sync(&self, filename: &str, modified: ModifiedTime) -> tokio::io::Result<bool> {
-        if self.files_sync_status.lock().unwrap().get(filename).map(|file| file.is_done()).unwrap_or(false) {
-            let tmp_write_path = self.files_sync_status.lock().unwrap()[filename].tmp_write_path.clone();
+        if self.files_sync_status.lock().unwrap().is_done(filename) {
+            let tmp_write_path = self.files_sync_status.lock().unwrap().get_tmp_write_path(filename).unwrap().0.clone();
             self.file_changes_finder.lock().unwrap().add_external(PathBuf::from(filename), modified);
 
             let path = self.folder.join(filename);
@@ -411,11 +372,7 @@ impl FileSyncManager {
 
             tokio::fs::rename(tmp_write_path, path).await?;
 
-            let redistribute = self.files_sync_status
-                .lock().unwrap()
-                .remove(filename)
-                .map(|file_sync_status| file_sync_status.redistribute).unwrap_or(false);
-
+            let redistribute = self.files_sync_status.lock().unwrap().remove(filename);
             println!("Completed sync of file: {}", filename);
             return Ok(redistribute);
         }

@@ -102,7 +102,7 @@ pub async fn list_files(folder: &Path) -> tokio::io::Result<Vec<File>> {
     Ok(files)
 }
 
-pub async fn remote_is_newer(path: &Path, request_time: &ModifiedTime) -> bool {
+pub async fn is_remote_newer(path: &Path, request_time: &ModifiedTime) -> bool {
     tokio::fs::metadata(path).await.map(|metadata| {
         let modified = metadata.modified().unwrap();
         let modified = ModifiedTime::from_system_time(modified);
@@ -157,7 +157,7 @@ impl FileRequest {
 }
 
 pub async fn start_file_sync(folder: &Path, filename: String, redistribute: bool) -> tokio::io::Result<SyncCommand> {
-    println!("Sending file: {}", filename);
+    println!("Syncing file: {}", filename);
 
     let path = folder.join(&filename);
 
@@ -226,11 +226,8 @@ pub async fn write_file_block(path: &Path,
     file.write_all(content).await?;
     file.flush().await?;
 
-    utime(
-        &path,
-        &modified,
-        &modified
-    ).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+    utime(&path, &modified, &modified)
+        .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
 
     Ok(())
 }
