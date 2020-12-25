@@ -272,7 +272,7 @@ impl FileSyncManager {
 
                         self.received_file_block(&filename, &block, content.len());
                         if self.try_complete_file_sync(&filename, modified).await? {
-                            self.start_file_sync_all(filename, false).await;
+                            self.send_commands_all(SyncCommand::SendFile(filename, modified));
                         }
                     }
                 } else {
@@ -466,7 +466,8 @@ impl FileSyncManager {
         if !clients_commands_sender_guard.is_empty() {
             let mut keys = clients_commands_sender_guard.keys().collect::<Vec<_>>();
             keys.shuffle(&mut thread_rng());
-            let count = thread_rng().gen_range(1..(keys.len() + 1));
+            // let count = thread_rng().gen_range(1..(keys.len() + 1));
+            let count = 1;
 
             for client in &keys[..count] {
                 if let Err(err) = clients_commands_sender_guard[*client].send(command.clone()) {
