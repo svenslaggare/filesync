@@ -148,7 +148,7 @@ impl FileRequest {
     }
 }
 
-pub async fn start_file_sync(folder: &Path, filename: String) -> tokio::io::Result<SyncCommand> {
+pub async fn start_file_sync(folder: &Path, filename: String, redistribute: bool) -> tokio::io::Result<SyncCommand> {
     println!("Sending file: {}", filename);
 
     let path = folder.join(&filename);
@@ -163,7 +163,8 @@ pub async fn start_file_sync(folder: &Path, filename: String) -> tokio::io::Resu
     Ok(
         SyncCommand::StartSyncFile {
             filename: filename.clone(),
-            request: file_request
+            request: file_request,
+            redistribute
         }
     )
 }

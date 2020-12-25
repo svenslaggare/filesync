@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering, AtomicU64};
 
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
+use rand::seq::SliceRandom;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::net::TcpStream;
@@ -25,7 +26,7 @@ pub enum SyncCommand {
     AcceptedFileSync(u64, bool),
     SyncFiles { files: Vec<(String, ModifiedTime)>, two_way: bool },
     GetFile(String),
-    StartSyncFile { filename: String, request: FileRequest },
+    StartSyncFile { filename: String, request: FileRequest, redistribute: bool },
     GetFileBlock { filename: String, block: FileBlock },
     FileBlock { filename: String, block: FileBlock, hash: String, content: Vec<u8> },
     DeleteFile(String)
@@ -53,11 +54,12 @@ pub type SyncCommandsReceiver = mpsc::UnboundedReceiver<SyncCommand>;
 struct FileSyncStatus {
     tmp_write_path: PathBuf,
     request: FileRequest,
-    done_blocks: HashSet<u64>
+    done_blocks: HashSet<u64>,
+    redistribute: bool
 }
 
 impl FileSyncStatus {
-    pub fn new(folder: &Path, request: FileRequest) -> FileSyncStatus {
+    pub fn new(folder: &Path, request: FileRequest, redistribute: bool) -> FileSyncStatus {
         let tmp_filename: String = thread_rng()
             .sample_iter(&Alphanumeric)
             .map(char::from)
@@ -67,7 +69,8 @@ impl FileSyncStatus {
         FileSyncStatus {
             tmp_write_path: folder.join(".filesync").join(&tmp_filename),
             request,
-            done_blocks: HashSet::new()
+            done_blocks: HashSet::new(),
+            redistribute
         }
     }
 
@@ -147,11 +150,7 @@ impl FileSyncManager {
             SyncCommand::AcceptedFileSync(id, two_way) => {
                 println!("Got sync request id #{}", id);
 
-                let sync = {
-                    let mut sync_requests_guard = self.sync_requests.lock().unwrap();
-                    sync_requests_guard.insert(id)
-                };
-
+                let sync = self.sync_requests.lock().unwrap().insert(id);
                 if sync {
                     println!("Requesting sync of files with {}.", destination_address);
 
@@ -185,7 +184,7 @@ impl FileSyncManager {
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
                         SyncAction::SendFile(filename) => {
-                            commands_sender.send(files::start_file_sync(&self.folder, filename).await?)
+                            commands_sender.send(files::start_file_sync(&self.folder, filename, false).await?)
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
                         SyncAction::DeleteFile(filename) => {
@@ -199,15 +198,21 @@ impl FileSyncManager {
             SyncCommand::GetFile(filename) => {
                 commands_sender.send(files::start_file_sync(
                     &self.folder,
-                    filename
+                    filename,
+                    false
                 ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
             }
-            SyncCommand::StartSyncFile { filename, request } => {
+            SyncCommand::StartSyncFile { filename, request, redistribute } => {
                 if files::remote_is_newer(&self.folder.join(&filename), &request.modified).await {
-                    println!("Starting sync of file: {} ({} bytes)", filename, request.size);
+                    println!(
+                        "Starting sync of file: {} ({} bytes), redistribute: {}",
+                        filename,
+                        request.size,
+                        redistribute
+                    );
 
                     let mut request_file_block_queue_guard = self.request_file_block_queue.lock().unwrap();
-                    for block in self.start_file_sync(&filename, request).file_blocks() {
+                    for block in self.start_file_sync(&filename, request, redistribute).file_blocks() {
                         request_file_block_queue_guard.push_back((
                             commands_sender.clone(),
                             SyncCommand::GetFileBlock {
@@ -246,7 +251,9 @@ impl FileSyncManager {
                         ).await?;
 
                         self.received_file_block(&filename, &block, content.len());
-                        self.try_complete_file_sync(&filename, modified).await?;
+                        if self.try_complete_file_sync(&filename, modified).await? {
+                            self.start_file_sync_all(filename, false).await;
+                        }
                     }
                 } else {
                     println!(
@@ -333,9 +340,7 @@ impl FileSyncManager {
             for modified_file in file_changes.modified {
                 let filename = modified_file.path.to_str().unwrap().to_owned();
                 println!("Changed file '{}' at {}.", filename, modified_file.modified);
-                if let Ok(command) = files::start_file_sync(&self.folder, filename).await {
-                    self.send_commands_all(command);
-                }
+                self.start_file_sync_all(filename, true).await;
             }
 
             for deleted_file in file_changes.deleted {
@@ -346,11 +351,11 @@ impl FileSyncManager {
         }
     }
 
-    pub fn start_file_sync(&self, filename: &str, request: FileRequest) -> FileRequest {
+    pub fn start_file_sync(&self, filename: &str, request: FileRequest, redistribute: bool) -> FileRequest {
         let mut files_sync_status_guard = self.files_sync_status.lock().unwrap();
         files_sync_status_guard.insert(
             filename.to_owned(),
-            FileSyncStatus::new(&self.folder, request)
+            FileSyncStatus::new(&self.folder, request, redistribute)
         );
 
         files_sync_status_guard[filename].request.clone()
@@ -374,7 +379,7 @@ impl FileSyncManager {
         }
     }
 
-    async fn try_complete_file_sync(&self, filename: &str, modified: ModifiedTime) -> tokio::io::Result<()> {
+    async fn try_complete_file_sync(&self, filename: &str, modified: ModifiedTime) -> tokio::io::Result<bool> {
         if self.files_sync_status.lock().unwrap().get(filename).map(|file| file.is_done()).unwrap_or(false) {
             let tmp_write_path = self.files_sync_status.lock().unwrap()[filename].tmp_write_path.clone();
             self.file_changes_finder.lock().unwrap().add_external(PathBuf::from(filename), modified);
@@ -386,11 +391,26 @@ impl FileSyncManager {
 
             tokio::fs::rename(tmp_write_path, path).await?;
 
-            self.files_sync_status.lock().unwrap().remove(filename);
+            let redistribute = self.files_sync_status
+                .lock().unwrap()
+                .remove(filename)
+                .map(|file_sync_status| file_sync_status.redistribute).unwrap_or(false);
+
             println!("Completed sync of file: {}", filename);
+            return Ok(redistribute);
         }
 
-        Ok(())
+        Ok(false)
+    }
+
+    async fn start_file_sync_all(&self, filename: String, subset: bool) {
+        if let Ok(command) = files::start_file_sync(&self.folder, filename, true).await {
+            if subset {
+                self.send_commands_random_subset(command);
+            } else {
+                self.send_commands_all(command);
+            }
+        }
     }
 
     pub fn add_client(&self, client_id: ClientId, commands_sender: SyncCommandsSender) {
@@ -402,10 +422,30 @@ impl FileSyncManager {
     }
 
     pub fn send_commands_all(&self, command: SyncCommand) {
-        for commands_sender in self.clients_commands_sender.lock().unwrap().values_mut() {
+        for commands_sender in self.clients_commands_sender.lock().unwrap().values() {
             if let Err(err) = commands_sender.send(command.clone()) {
                 println!("{:?}", err);
             }
+        }
+    }
+
+    pub fn send_commands_random_subset(&self, command: SyncCommand) -> usize {
+        let clients_commands_sender_guard = self.clients_commands_sender.lock().unwrap();
+
+        if !clients_commands_sender_guard.is_empty() {
+            let mut keys = clients_commands_sender_guard.keys().collect::<Vec<_>>();
+            keys.shuffle(&mut thread_rng());
+            let count = thread_rng().gen_range(1..(keys.len() + 1));
+
+            for client_index in &keys[..count] {
+                if let Err(err) = clients_commands_sender_guard[*client_index].send(command.clone()) {
+                    println!("{:?}", err);
+                }
+            }
+
+            count
+        } else {
+            0
         }
     }
 }
