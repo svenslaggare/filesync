@@ -304,8 +304,22 @@ impl FileSyncManager {
 
         while self.num_active_file_block_requests.load(Ordering::SeqCst) < 10 {
             if let Some((commands_sender, command)) = request_file_block_queue_guard.pop_front() {
+                let command_clone = command.clone();
                 if commands_sender.send(command).is_ok() {
                     self.num_active_file_block_requests.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    match command_clone {
+                        SyncCommand::GetFileBlock { filename, .. } => {
+                            if let Some(file_sync_status) = self.files_sync_status.lock().unwrap().remove_failed(&filename) {
+                                println!("Failed to sync file '{}'.", filename);
+
+                                #[allow(unused_must_use)] {
+                                    self.get_file_from_random(filename, file_sync_status.request.modified);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             } else {
                 break;
@@ -372,7 +386,7 @@ impl FileSyncManager {
 
             tokio::fs::rename(tmp_write_path, path).await?;
 
-            let redistribute = self.files_sync_status.lock().unwrap().remove(filename);
+            let redistribute = self.files_sync_status.lock().unwrap().remove_success(filename);
             println!("Completed sync of file: {}", filename);
             return Ok(redistribute);
         }
@@ -392,7 +406,7 @@ impl FileSyncManager {
 
     fn get_file_from_random(&self, filename: String, modified: ModifiedTime) -> tokio::io::Result<()> {
         let command = SyncCommand::GetFile(filename, modified);
-        for _ in 0..5 {
+        for _ in 0..10 {
             if self.send_command_random(command.clone()) {
                 return Ok(());
             }

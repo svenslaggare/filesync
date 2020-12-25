@@ -66,10 +66,14 @@ impl FilesSyncStatus {
         self.files[filename].request.clone()
     }
 
-    pub fn remove(&mut self, filename: &str) -> bool {
+    pub fn remove_success(&mut self, filename: &str) -> bool {
         self.files
             .remove(filename)
             .map(|file_sync_status| file_sync_status.redistribute).unwrap_or(false)
+    }
+
+    pub fn remove_failed(&mut self, filename: &str) -> Option<FileSyncStatus> {
+        self.files.remove(filename)
     }
 
     pub fn get_mut(&mut self, filename: &str) -> Option<&mut FileSyncStatus> {
