@@ -201,7 +201,7 @@ impl FileSyncManager {
                             redistribute
                         );
 
-                        for block in self.start_file_sync(&filename, request, redistribute).file_blocks() {
+                        for block in self.start_file_sync(&filename, request, redistribute) {
                             request_file_block_queue_guard.push_back((
                                 commands_sender.clone(),
                                 SyncCommand::GetFileBlock {
@@ -352,7 +352,7 @@ impl FileSyncManager {
         }
     }
 
-    pub fn start_file_sync(&self, filename: &str, request: FileRequest, redistribute: bool) -> FileRequest {
+    pub fn start_file_sync(&self, filename: &str, request: FileRequest, redistribute: bool) -> Vec<FileBlock> {
         self.files_sync_status.lock().unwrap().add(&self.folder, filename, request, redistribute)
     }
 

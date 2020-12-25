@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 
-use crate::files::{FileRequest, ModifiedTime};
+use crate::files::{FileRequest, ModifiedTime, FileBlock};
 
+#[derive(Clone)]
 pub struct FileSyncStatus {
     pub tmp_write_path: PathBuf,
     pub request: FileRequest,
@@ -32,16 +33,24 @@ impl FileSyncStatus {
     pub fn is_done(&self) -> bool {
         self.done_blocks.len() as u64 == self.request.num_blocks
     }
+
+    pub fn file_blocks(&self) -> Vec<FileBlock> {
+        self.request.file_blocks()
+            .filter(|block| !self.done_blocks.contains(&block.number))
+            .collect()
+    }
 }
 
 pub struct FilesSyncStatus {
-    files: HashMap<String, FileSyncStatus>
+    files: HashMap<String, FileSyncStatus>,
+    partial_files: HashMap<(String, ModifiedTime), FileSyncStatus>
 }
 
 impl FilesSyncStatus {
     pub fn new() -> FilesSyncStatus {
         FilesSyncStatus {
-            files: HashMap::new()
+            files: HashMap::new(),
+            partial_files: HashMap::new()
         }
     }
 
@@ -57,13 +66,20 @@ impl FilesSyncStatus {
                folder: &Path,
                filename: &str,
                request: FileRequest,
-               redistribute: bool) -> FileRequest {
-        self.files.insert(
-            filename.to_owned(),
-            FileSyncStatus::new(folder, request, redistribute)
-        );
+               redistribute: bool) -> Vec<FileBlock> {
+        if let Some(partial_sync) = self.partial_files.remove(&(filename.to_owned(), request.modified)) {
+            self.files.insert(
+                filename.to_owned(),
+                partial_sync
+            );
+        } else {
+            self.files.insert(
+                filename.to_owned(),
+                FileSyncStatus::new(folder, request, redistribute)
+            );
+        }
 
-        self.files[filename].request.clone()
+        self.files[filename].file_blocks()
     }
 
     pub fn remove_success(&mut self, filename: &str) -> bool {
@@ -73,7 +89,16 @@ impl FilesSyncStatus {
     }
 
     pub fn remove_failed(&mut self, filename: &str) -> Option<FileSyncStatus> {
-        self.files.remove(filename)
+        if let Some(file_sync_status) = self.files.remove(filename) {
+            self.partial_files.insert(
+                (filename.to_owned(), file_sync_status.request.modified),
+                file_sync_status.clone()
+            );
+
+            Some(file_sync_status)
+        } else {
+            None
+        }
     }
 
     pub fn get_mut(&mut self, filename: &str) -> Option<&mut FileSyncStatus> {
