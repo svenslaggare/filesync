@@ -261,9 +261,10 @@ impl FileSyncManager {
             }
             SyncCommand::DeleteFile(filename, modified) => {
                 println!("Deleting file: {}", filename);
-                self.delete_log.lock().await.add_entry(&filename, modified);
-                self.file_changes_finder.lock().unwrap().add_external_delete(PathBuf::from(filename.clone()));
-                tokio::fs::remove_file(self.folder.join(PathBuf::from(filename))).await?;
+                if let Ok(()) = tokio::fs::remove_file(self.folder.join(Path::new(&filename))).await {
+                    self.delete_log.lock().await.add_entry(&filename, modified);
+                    self.file_changes_finder.lock().unwrap().add_external_delete(PathBuf::from(filename.clone()));
+                }
             }
         }
 
