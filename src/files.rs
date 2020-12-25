@@ -110,6 +110,14 @@ pub async fn remote_is_newer(path: &Path, request_time: &ModifiedTime) -> bool {
     }).unwrap_or(true)
 }
 
+pub async fn has_file(path: &Path, request_time: &ModifiedTime) -> bool {
+    tokio::fs::metadata(path).await.map(|metadata| {
+        let modified = metadata.modified().unwrap();
+        let modified = ModifiedTime::from_system_time(modified);
+        request_time == &modified
+    }).unwrap_or(false)
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileBlock {
     pub number: u64,

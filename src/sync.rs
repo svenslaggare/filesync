@@ -5,8 +5,8 @@ use std::iter::FromIterator;
 use crate::files::{File, ModifiedTime};
 
 pub enum SyncAction {
-    GetFile(String),
-    SendFile(String),
+    GetFile(String, ModifiedTime),
+    SendFile(String, ModifiedTime),
     DeleteFile(String)
 }
 
@@ -30,9 +30,9 @@ pub fn compute_sync_actions(files: Vec<File>, other_files: Vec<File>, two_way: b
                 let filename = file1.path.to_str().unwrap().to_owned();
 
                 if send {
-                    actions.push(SyncAction::SendFile(filename));
+                    actions.push(SyncAction::SendFile(filename, file1.modified));
                 } else {
-                    actions.push(SyncAction::GetFile(filename));
+                    actions.push(SyncAction::GetFile(filename, file1.modified));
                 }
             }
         }

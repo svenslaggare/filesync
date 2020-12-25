@@ -25,7 +25,9 @@ pub enum SyncCommand {
     RequestFileSync(u64, bool),
     AcceptedFileSync(u64, bool),
     SyncFiles { files: Vec<(String, ModifiedTime)>, two_way: bool },
-    GetFile(String),
+    GetFile(String, ModifiedTime),
+    GetFileDenied(String, ModifiedTime),
+    SendFile(String, ModifiedTime),
     StartSyncFile { filename: String, request: FileRequest, redistribute: bool },
     GetFileBlock { filename: String, block: FileBlock },
     FileBlock { filename: String, block: FileBlock, hash: String, content: Vec<u8> },
@@ -178,13 +180,14 @@ impl FileSyncManager {
 
                 for action in sync::compute_sync_actions(files, other_files, two_way) {
                     match action {
-                        SyncAction::GetFile(filename) => {
+                        SyncAction::GetFile(filename, modified) => {
                             println!("Get file: {}", filename);
-                            commands_sender.send(SyncCommand::GetFile(filename))
+                            commands_sender.send(SyncCommand::GetFile(filename, modified))
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
-                        SyncAction::SendFile(filename) => {
-                            commands_sender.send(files::start_file_sync(&self.folder, filename, false).await?)
+                        SyncAction::SendFile(filename, modified) => {
+                            println!("Start sending file: {}", filename);
+                            commands_sender.send(SyncCommand::SendFile(filename, modified))
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
                         SyncAction::DeleteFile(filename) => {
@@ -195,31 +198,48 @@ impl FileSyncManager {
                     }
                 }
             }
-            SyncCommand::GetFile(filename) => {
-                commands_sender.send(files::start_file_sync(
-                    &self.folder,
-                    filename,
-                    false
-                ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+            SyncCommand::GetFile(filename, modified) => {
+                if files::has_file(&self.folder.join(&filename), &modified).await {
+                    commands_sender.send(files::start_file_sync(
+                        &self.folder,
+                        filename,
+                        false
+                    ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                } else {
+                    println!("Don't got file {} @ {}", filename, modified.to_unix_seconds());
+                    commands_sender.send(SyncCommand::GetFileDenied(filename, modified))
+                        .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                }
             }
+            SyncCommand::GetFileDenied(filename, modified) => {
+                self.get_file_from_random(filename, modified)?;
+            },
+            SyncCommand::SendFile(filename, modified) => {
+                self.get_file_from_random(filename, modified)?;
+            },
             SyncCommand::StartSyncFile { filename, request, redistribute } => {
                 if files::remote_is_newer(&self.folder.join(&filename), &request.modified).await {
-                    println!(
-                        "Starting sync of file: {} ({} bytes), redistribute: {}",
-                        filename,
-                        request.size,
-                        redistribute
-                    );
+                    if !self.files_sync_status.lock().unwrap().contains_key(&filename) {
+                        let mut request_file_block_queue_guard = self.request_file_block_queue.lock().unwrap();
 
-                    let mut request_file_block_queue_guard = self.request_file_block_queue.lock().unwrap();
-                    for block in self.start_file_sync(&filename, request, redistribute).file_blocks() {
-                        request_file_block_queue_guard.push_back((
-                            commands_sender.clone(),
-                            SyncCommand::GetFileBlock {
-                                filename: filename.clone(),
-                                block,
-                            }
-                        ));
+                        println!(
+                            "Starting sync of file: {} ({} bytes), redistribute: {}",
+                            filename,
+                            request.size,
+                            redistribute
+                        );
+
+                        for block in self.start_file_sync(&filename, request, redistribute).file_blocks() {
+                            request_file_block_queue_guard.push_back((
+                                commands_sender.clone(),
+                                SyncCommand::GetFileBlock {
+                                    filename: filename.clone(),
+                                    block,
+                                }
+                            ));
+                        }
+                    } else {
+                        println!("Sync request for file {} is already ongoing.", filename);
                     }
                 } else {
                     println!("Sync request for file {} is older than what we have locally.", filename);
@@ -413,6 +433,17 @@ impl FileSyncManager {
         }
     }
 
+    fn get_file_from_random(&self, filename: String, modified: ModifiedTime) -> tokio::io::Result<()> {
+        let command = SyncCommand::GetFile(filename, modified);
+        for _ in 0..5 {
+            if self.send_command_random(command.clone()) {
+                return Ok(());
+            }
+        }
+
+        return Err(tokio::io::Error::from(ErrorKind::Other));
+    }
+
     pub fn add_client(&self, client_id: ClientId, commands_sender: SyncCommandsSender) {
         self.clients_commands_sender.lock().unwrap().insert(client_id, commands_sender);
     }
@@ -437,8 +468,8 @@ impl FileSyncManager {
             keys.shuffle(&mut thread_rng());
             let count = thread_rng().gen_range(1..(keys.len() + 1));
 
-            for client_index in &keys[..count] {
-                if let Err(err) = clients_commands_sender_guard[*client_index].send(command.clone()) {
+            for client in &keys[..count] {
+                if let Err(err) = clients_commands_sender_guard[*client].send(command.clone()) {
                     println!("{:?}", err);
                 }
             }
@@ -446,6 +477,20 @@ impl FileSyncManager {
             count
         } else {
             0
+        }
+    }
+
+    pub fn send_command_random(&self, command: SyncCommand) -> bool {
+        let clients_commands_sender_guard = self.clients_commands_sender.lock().unwrap();
+
+        if !clients_commands_sender_guard.is_empty() {
+            let mut keys = clients_commands_sender_guard.keys().collect::<Vec<_>>();
+            keys.shuffle(&mut thread_rng());
+
+            let key = keys[0];
+            clients_commands_sender_guard[key].send(command.clone()).is_ok()
+        } else {
+            false
         }
     }
 }
