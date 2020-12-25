@@ -47,6 +47,9 @@ impl SyncCommand {
     }
 }
 
+pub type SyncCommandsSender = mpsc::UnboundedSender<SyncCommand>;
+pub type SyncCommandsReceiver = mpsc::UnboundedReceiver<SyncCommand>;
+
 struct FileSyncStatus {
     tmp_write_path: PathBuf,
     request: FileRequest,
@@ -76,9 +79,9 @@ impl FileSyncStatus {
 pub struct FileSyncManager {
     pub folder: PathBuf,
     files_sync_status: Mutex<HashMap<String, FileSyncStatus>>,
-    clients_commands_sender: Mutex<HashMap<ClientId, mpsc::UnboundedSender<SyncCommand>>>,
+    clients_commands_sender: Mutex<HashMap<ClientId, SyncCommandsSender>>,
     file_changes_finder: Mutex<FileChangesFinder>,
-    request_file_block_queue: Mutex<VecDeque<(mpsc::UnboundedSender<SyncCommand>, SyncCommand)>>,
+    request_file_block_queue: Mutex<VecDeque<(SyncCommandsSender, SyncCommand)>>,
     num_active_file_block_requests: AtomicI64,
     next_sync_request_id: AtomicU64,
     sync_requests: Mutex<HashSet<u64>>
@@ -98,15 +101,47 @@ impl FileSyncManager {
         }
     }
 
+    pub async fn run(&self,
+                     client: TcpStream,
+                     commands_channel: (SyncCommandsSender, SyncCommandsReceiver),
+                     initial_sync: bool) -> tokio::io::Result<()> {
+        let (mut commands_sender, mut commands_receiver) = commands_channel;
+        let destination_address = client.peer_addr().unwrap();
+        let (mut client_reader, mut client_writer) = client.into_split();
+
+        tokio::spawn(async move {
+            while let Some(command) = commands_receiver.recv().await {
+                if let Err(_) = command.send_command(&mut client_writer).await {
+                    break;
+                }
+            }
+        });
+
+        if initial_sync {
+            self.request_sync(false, &mut commands_sender)?;
+        }
+
+        loop {
+            let command = SyncCommand::receive_command(&mut client_reader).await?;
+            self.handle(
+                destination_address,
+                &mut commands_sender,
+                command
+            ).await?;
+        }
+    }
+
     pub async fn handle(&self,
                         destination_address: SocketAddr,
-                        commands_sender: &mut mpsc::UnboundedSender<SyncCommand>,
+                        commands_sender: &mut SyncCommandsSender,
                         command: SyncCommand) -> tokio::io::Result<()> {
         match command {
             SyncCommand::RequestFileSync(id, two_way) => {
                 if self.files_sync_status.lock().unwrap().is_empty() {
                     commands_sender.send(SyncCommand::AcceptedFileSync(id, two_way))
                         .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                } else {
+                    println!("Denied sync request #{}", id);
                 }
             }
             SyncCommand::AcceptedFileSync(id, two_way) => {
@@ -168,13 +203,7 @@ impl FileSyncManager {
                 ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
             }
             SyncCommand::StartSyncFile { filename, request } => {
-                let is_newer = tokio::fs::metadata(self.folder.join(&filename)).await.map(|metadata| {
-                    let modified = metadata.modified().unwrap();
-                    let modified = ModifiedTime::from_system_time(modified);
-                    request.modified.is_newer(&modified)
-                }).unwrap_or(true);
-
-                if is_newer {
+                if files::remote_is_newer(&self.folder.join(&filename), &request.modified).await {
                     println!("Starting sync of file: {} ({} bytes)", filename, request.size);
 
                     let mut request_file_block_queue_guard = self.request_file_block_queue.lock().unwrap();
@@ -188,7 +217,7 @@ impl FileSyncManager {
                         ));
                     }
                 } else {
-                    println!("Sync request {} is older than what we have.", filename);
+                    println!("Sync request for file {} is older than what we have locally.", filename);
                 }
             }
             SyncCommand::GetFileBlock { filename, block } => {
@@ -248,7 +277,7 @@ impl FileSyncManager {
 
     pub fn request_sync(&self,
                         two_way: bool,
-                        commands_sender: &mut mpsc::UnboundedSender<SyncCommand>) -> tokio::io::Result<()> {
+                        commands_sender: &mut SyncCommandsSender) -> tokio::io::Result<()> {
         let sync_id = self.next_sync_request_id.load(Ordering::SeqCst);
         println!("Sending sync request #{}", sync_id);
         commands_sender.send(SyncCommand::RequestFileSync(sync_id, two_way))
@@ -364,7 +393,7 @@ impl FileSyncManager {
         Ok(())
     }
 
-    pub fn add_client(&self, client_id: ClientId, commands_sender: mpsc::UnboundedSender<SyncCommand>) {
+    pub fn add_client(&self, client_id: ClientId, commands_sender: SyncCommandsSender) {
         self.clients_commands_sender.lock().unwrap().insert(client_id, commands_sender);
     }
 
@@ -378,37 +407,6 @@ impl FileSyncManager {
                 println!("{:?}", err);
             }
         }
-    }
-}
-
-pub async fn run_sync_client(file_sync_manager: Arc<FileSyncManager>,
-                             client: TcpStream,
-                             commands_channel: (mpsc::UnboundedSender<SyncCommand>,
-                                                mpsc::UnboundedReceiver<SyncCommand>),
-                             initial_sync: bool) -> tokio::io::Result<()> {
-    let (mut commands_sender, mut commands_receiver) = commands_channel;
-    let destination_address = client.peer_addr().unwrap();
-    let (mut client_reader, mut client_writer) = client.into_split();
-
-    tokio::spawn(async move {
-        while let Some(command) = commands_receiver.recv().await {
-            if let Err(_) = command.send_command(&mut client_writer).await {
-                break;
-            }
-        }
-    });
-
-    if initial_sync {
-        file_sync_manager.request_sync(false, &mut commands_sender)?;
-    }
-
-    loop {
-        let command = SyncCommand::receive_command(&mut client_reader).await?;
-        file_sync_manager.handle(
-            destination_address,
-            &mut commands_sender,
-            command
-        ).await?;
     }
 }
 

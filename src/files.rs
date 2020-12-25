@@ -102,6 +102,14 @@ pub async fn list_files(folder: &Path) -> tokio::io::Result<Vec<File>> {
     Ok(files)
 }
 
+pub async fn remote_is_newer(path: &Path, request_time: &ModifiedTime) -> bool {
+    tokio::fs::metadata(path).await.map(|metadata| {
+        let modified = metadata.modified().unwrap();
+        let modified = ModifiedTime::from_system_time(modified);
+        request_time.is_newer(&modified)
+    }).unwrap_or(true)
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileBlock {
     pub number: u64,

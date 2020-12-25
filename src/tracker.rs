@@ -10,8 +10,7 @@ use tokio::sync::mpsc;
 
 use serde::{Serialize, Deserialize};
 
-use crate::{filesync};
-use crate::filesync::{FileSyncManager, SyncCommand};
+use crate::filesync::{FileSyncManager};
 
 #[derive(Copy, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClientId(pub u64);
@@ -211,10 +210,9 @@ async fn start_sync_server(file_sync_manager: Arc<FileSyncManager>) -> SocketAdd
 
                 let file_sync_manager_clone = file_sync_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(result) = filesync::run_sync_client(file_sync_manager_clone,
-                                                                   sync_client,
-                                                                   mpsc::unbounded_channel(),
-                                                                   false).await {
+                    if let Err(result) = file_sync_manager_clone.run(sync_client,
+                                                                     mpsc::unbounded_channel(),
+                                                                     false).await {
                         println!("Sync client error: {:?}", result);
                     }
                 });
@@ -233,12 +231,11 @@ async fn start_sync_client(client: TrackerClient,
     let sync_client = TcpStream::connect(client.address).await?;
 
     tokio::spawn(async move {
-        let commands_channel = mpsc::unbounded_channel::<SyncCommand>();
+        let commands_channel = mpsc::unbounded_channel();
         file_sync_manager.add_client(client.id, commands_channel.0.clone());
-        if let Err(result) = filesync::run_sync_client(file_sync_manager,
-                                                       sync_client,
-                                                       commands_channel,
-                                                       sync).await {
+        if let Err(result) = file_sync_manager.run(sync_client,
+                                                   commands_channel,
+                                                   sync).await {
             println!("Sync client error: {:?}", result);
         }
     });
