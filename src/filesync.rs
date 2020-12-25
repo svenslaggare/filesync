@@ -315,6 +315,8 @@ impl FileSyncManager {
                                     #[allow(unused_must_use)] {
                                         self.get_file_from_random(filename, file_sync_status.request.modified);
                                     }
+                                } else {
+                                    self.num_active_file_block_requests.fetch_sub(1, Ordering::SeqCst);
                                 }
                             }
                             _ => {}
