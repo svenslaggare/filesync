@@ -304,21 +304,21 @@ impl FileSyncManager {
 
         while self.num_active_file_block_requests.load(Ordering::SeqCst) < 10 {
             if let Some((commands_sender, command)) = request_file_block_queue_guard.pop_front() {
-                let command_clone = command.clone();
-                if commands_sender.send(command).is_ok() {
-                    self.num_active_file_block_requests.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    match command_clone {
-                        SyncCommand::GetFileBlock { filename, .. } => {
-                            if let Some(file_sync_status) = self.files_sync_status.lock().unwrap().remove_failed(&filename) {
-                                println!("Failed to sync file '{}'.", filename);
+                match commands_sender.send(command) {
+                    Ok(()) => {}
+                    Err(command) => {
+                        match command.0 {
+                            SyncCommand::GetFileBlock { filename, .. } => {
+                                if let Some(file_sync_status) = self.files_sync_status.lock().unwrap().remove_failed(&filename) {
+                                    println!("Failed to sync file '{}'.", filename);
 
-                                #[allow(unused_must_use)] {
-                                    self.get_file_from_random(filename, file_sync_status.request.modified);
+                                    #[allow(unused_must_use)] {
+                                        self.get_file_from_random(filename, file_sync_status.request.modified);
+                                    }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             } else {
