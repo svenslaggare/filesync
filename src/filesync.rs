@@ -16,22 +16,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::files::{FileBlock, File, FileRequest, hash_file_block, ModifiedTime};
 use crate::{files, sync};
-use crate::sync::{SyncAction, FileChangesFinder};
+use crate::sync::{SyncAction, FileChangesFinder, DeleteLog};
 use crate::tracker::ClientId;
 use crate::sync_status::FilesSyncStatus;
+use std::ops::Deref;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
-    RequestFileSync(u64, bool),
-    AcceptedFileSync(u64, bool),
-    SyncFiles { files: Vec<(String, ModifiedTime)>, two_way: bool },
-    GetFile(String, ModifiedTime),
+    RequestFileSync(u64),
+    AcceptedFileSync(u64),
+    SyncFiles { files: Vec<(String, ModifiedTime)> },
+    GetFile(String, ModifiedTime, bool),
     GetFileDenied(String, ModifiedTime),
     SendFile(String, ModifiedTime),
     StartSyncFile { filename: String, request: FileRequest, redistribute: bool },
     GetFileBlock { filename: String, block: FileBlock },
     FileBlock { filename: String, block: FileBlock, hash: String, content: Vec<u8> },
-    DeleteFile(String)
+    DeleteFile(String, ModifiedTime)
 }
 
 impl SyncCommand {
@@ -58,6 +59,7 @@ pub struct FileSyncManager {
     files_sync_status: Mutex<FilesSyncStatus>,
     clients_commands_sender: Mutex<HashMap<ClientId, SyncCommandsSender>>,
     file_changes_finder: Mutex<FileChangesFinder>,
+    delete_log: tokio::sync::Mutex<DeleteLog>,
     request_file_block_queue: Mutex<VecDeque<(SyncCommandsSender, SyncCommand)>>,
     num_active_file_block_requests: AtomicI64,
     next_sync_request_id: AtomicU64,
@@ -67,10 +69,11 @@ pub struct FileSyncManager {
 impl FileSyncManager {
     pub fn new(folder: PathBuf) -> FileSyncManager {
         FileSyncManager {
-            folder,
+            folder: folder.clone(),
             files_sync_status: Mutex::new(FilesSyncStatus::new()),
             clients_commands_sender: Mutex::new(HashMap::new()),
             file_changes_finder: Mutex::new(FileChangesFinder::new()),
+            delete_log:  tokio::sync::Mutex::new(DeleteLog::new(folder.clone())),
             request_file_block_queue: Mutex::new(VecDeque::new()),
             num_active_file_block_requests: AtomicI64::new(0),
             next_sync_request_id: AtomicU64::new(1),
@@ -95,7 +98,7 @@ impl FileSyncManager {
         });
 
         if initial_sync {
-            self.request_sync(false, &mut commands_sender)?;
+            self.request_sync(&mut commands_sender)?;
         }
 
         loop {
@@ -113,15 +116,15 @@ impl FileSyncManager {
                         commands_sender: &mut SyncCommandsSender,
                         command: SyncCommand) -> tokio::io::Result<()> {
         match command {
-            SyncCommand::RequestFileSync(id, two_way) => {
+            SyncCommand::RequestFileSync(id) => {
                 if !self.files_sync_status.lock().unwrap().any_active() {
-                    commands_sender.send(SyncCommand::AcceptedFileSync(id, two_way))
+                    commands_sender.send(SyncCommand::AcceptedFileSync(id))
                         .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 } else {
                     println!("Denied sync request #{}", id);
                 }
             }
-            SyncCommand::AcceptedFileSync(id, two_way) => {
+            SyncCommand::AcceptedFileSync(id) => {
                 println!("Got sync request id #{}", id);
 
                 let sync = self.sync_requests.lock().unwrap().insert(id);
@@ -134,14 +137,13 @@ impl FileSyncManager {
                         files: files
                             .iter()
                             .map(|file| (file.path.to_str().unwrap().to_owned(), file.modified))
-                            .collect::<Vec<_>>(),
-                        two_way
+                            .collect::<Vec<_>>()
                     }).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
 
                     self.next_sync();
                 }
             }
-            SyncCommand::SyncFiles { files: other_files, two_way } => {
+            SyncCommand::SyncFiles { files: other_files } => {
                 println!("Syncing files...");
 
                 let files = files::list_files(&self.folder).await?;
@@ -150,11 +152,11 @@ impl FileSyncManager {
                     .map(|file| File::new(PathBuf::from(file.0), file.1))
                     .collect::<Vec<_>>();
 
-                for action in sync::compute_sync_actions(files, other_files, two_way) {
+                for action in sync::compute_sync_actions(files, other_files, &self.delete_log.lock().await.deref()) {
                     match action {
                         SyncAction::GetFile(filename, modified) => {
                             println!("Get file: {}", filename);
-                            commands_sender.send(SyncCommand::GetFile(filename, modified))
+                            commands_sender.send(SyncCommand::GetFile(filename, modified, true))
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
                         SyncAction::SendFile(filename, modified) => {
@@ -162,20 +164,20 @@ impl FileSyncManager {
                             commands_sender.send(SyncCommand::SendFile(filename, modified))
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
-                        SyncAction::DeleteFile(filename) => {
+                        SyncAction::DeleteFile(filename, modified) => {
                             println!("Delete file: {}", filename);
-                            commands_sender.send(SyncCommand::DeleteFile(filename))
+                            commands_sender.send(SyncCommand::DeleteFile(filename, modified))
                                 .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                         }
                     }
                 }
             }
-            SyncCommand::GetFile(filename, modified) => {
+            SyncCommand::GetFile(filename, modified, redistribute) => {
                 if files::has_file(&self.folder.join(&filename), &modified).await {
                     commands_sender.send(files::start_file_sync(
                         &self.folder,
                         filename,
-                        false
+                        redistribute
                     ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 } else {
                     println!("Don't got file {} @ {}", filename, modified.to_unix_seconds());
@@ -257,8 +259,9 @@ impl FileSyncManager {
                     }).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 }
             }
-            SyncCommand::DeleteFile(filename) => {
+            SyncCommand::DeleteFile(filename, modified) => {
                 println!("Deleting file: {}", filename);
+                self.delete_log.lock().await.add_entry(&filename, modified);
                 self.file_changes_finder.lock().unwrap().add_external_delete(PathBuf::from(filename.clone()));
                 tokio::fs::remove_file(self.folder.join(PathBuf::from(filename))).await?;
             }
@@ -277,21 +280,23 @@ impl FileSyncManager {
 
         let file_sync_manager = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
             loop {
                 interval.tick().await;
                 file_sync_manager.dispatch_file_block_requests();
+
+                if let Err(err) = file_sync_manager.delete_log.lock().await.save().await {
+                    println!("{:?}", err);
+                }
             }
         });
     }
 
-    fn request_sync(&self,
-                        two_way: bool,
-                        commands_sender: &mut SyncCommandsSender) -> tokio::io::Result<()> {
+    fn request_sync(&self, commands_sender: &mut SyncCommandsSender) -> tokio::io::Result<()> {
         let sync_id = self.next_sync_request_id.load(Ordering::SeqCst);
         println!("Sending sync request #{}", sync_id);
-        commands_sender.send(SyncCommand::RequestFileSync(sync_id, two_way))
+        commands_sender.send(SyncCommand::RequestFileSync(sync_id))
             .map_err(|_| tokio::io::Error::from(ErrorKind::Other))
     }
 
@@ -350,7 +355,8 @@ impl FileSyncManager {
             for deleted_file in file_changes.deleted {
                 let filename = deleted_file.path.to_str().unwrap().to_owned();
                 println!("Deleted file '{}'", filename);
-                self.send_commands_all(SyncCommand::DeleteFile(filename));
+                self.delete_log.lock().await.add_entry(&filename, deleted_file.modified);
+                self.send_commands_all(SyncCommand::DeleteFile(filename, deleted_file.modified));
             }
         }
     }
@@ -408,7 +414,7 @@ impl FileSyncManager {
     }
 
     fn get_file_from_random(&self, filename: String, modified: ModifiedTime) -> tokio::io::Result<()> {
-        let command = SyncCommand::GetFile(filename, modified);
+        let command = SyncCommand::GetFile(filename, modified, false);
         for _ in 0..10 {
             if self.send_command_random(command.clone()) {
                 return Ok(());
