@@ -25,9 +25,9 @@ use crate::sync_engine::{FilesSyncStatus, FileBlockRequestDispatcher, FileBlockR
 pub enum SyncCommand {
     RequestFileSync(u64),
     AcceptedFileSync(u64),
-    SyncFiles { files: Vec<(String, ModifiedTime)> },
+    SyncFiles(Vec<(String, ModifiedTime)>),
     GetFile(String, ModifiedTime, bool),
-    GetFileDenied(String, ModifiedTime),
+    GetFileDenied(String, ModifiedTime, bool),
     SendFile(String, ModifiedTime),
     StartSyncFile { filename: String, request: FileRequest, redistribute: bool },
     GetFileBlock { filename: String, block: FileBlock },
@@ -56,9 +56,9 @@ impl std::fmt::Display for SyncCommand {
         match self {
             SyncCommand::RequestFileSync(_) => write!(f, "RequestFileSync"),
             SyncCommand::AcceptedFileSync(_) => write!(f, "AcceptedFileSync"),
-            SyncCommand::SyncFiles { .. } => write!(f, "SyncFiles"),
+            SyncCommand::SyncFiles(_) => write!(f, "SyncFiles"),
             SyncCommand::GetFile(_, _, _) => write!(f, "GetFile"),
-            SyncCommand::GetFileDenied(_, _) => write!(f, "GetFileDenied"),
+            SyncCommand::GetFileDenied(_, _, _) => write!(f, "GetFileDenied"),
             SyncCommand::SendFile(_, _) => write!(f, "SendFile"),
             SyncCommand::StartSyncFile { .. } => write!(f, "StartSyncFile"),
             SyncCommand::GetFileBlock { .. } => write!(f, "GetFileBlock"),
@@ -168,17 +168,17 @@ impl FileSyncManager {
 
                     let files = files::list_files(&self.folder).await?;
 
-                    commands_sender.send(SyncCommand::SyncFiles {
-                        files: files
+                    commands_sender.send(SyncCommand::SyncFiles(
+                        files
                             .iter()
                             .map(|file| (file.path.to_str().unwrap().to_owned(), file.modified))
                             .collect::<Vec<_>>()
-                    }).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                    )).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
 
                     self.next_sync();
                 }
             }
-            SyncCommand::SyncFiles { files: other_files } => {
+            SyncCommand::SyncFiles(other_files) => {
                 println!("Syncing files...");
 
                 let files = files::list_files(&self.folder).await?;
@@ -188,23 +188,23 @@ impl FileSyncManager {
                     .collect::<Vec<_>>();
 
                 for action in sync::full_sync(files, other_files, &self.delete_log.lock().await.deref()) {
-                    match action {
+                    let command = match action {
                         SyncAction::GetFile(filename, modified) => {
                             println!("Get file: {}", filename);
-                            commands_sender.send(SyncCommand::GetFile(filename, modified, true))
-                                .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                            SyncCommand::GetFile(filename, modified, true)
                         }
                         SyncAction::SendFile(filename, modified) => {
                             println!("Sending file: {}", filename);
-                            commands_sender.send(SyncCommand::SendFile(filename, modified))
-                                .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                            SyncCommand::SendFile(filename, modified)
                         }
                         SyncAction::DeleteFile(filename, modified) => {
                             println!("Delete file: {}", filename);
-                            commands_sender.send(SyncCommand::DeleteFile(filename, modified))
-                                .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                            SyncCommand::DeleteFile(filename, modified)
                         }
-                    }
+                    };
+
+                    commands_sender.send(command)
+                        .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 }
             }
             SyncCommand::GetFile(filename, modified, redistribute) => {
@@ -216,15 +216,15 @@ impl FileSyncManager {
                     ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 } else {
                     println!("Don't got file {} @ {}", filename, modified.to_unix_seconds());
-                    commands_sender.send(SyncCommand::GetFileDenied(filename, modified))
+                    commands_sender.send(SyncCommand::GetFileDenied(filename, modified, redistribute))
                         .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 }
             }
-            SyncCommand::GetFileDenied(filename, modified) => {
-                self.get_file_from_random(filename, modified, &HashSet::new())?;
+            SyncCommand::GetFileDenied(filename, modified, redistribute) => {
+                self.get_file_from_random(filename, modified, redistribute, &HashSet::new())?;
             },
             SyncCommand::SendFile(filename, modified) => {
-                self.get_file_from_random(filename, modified, &HashSet::new())?;
+                self.get_file_from_random(filename, modified, false, &HashSet::new())?;
             },
             SyncCommand::StartSyncFile { filename, request, redistribute } => {
                 if files::is_remote_newer(&self.folder.join(&filename), &request.modified).await {
@@ -426,8 +426,12 @@ impl FileSyncManager {
         }
     }
 
-    fn get_file_from_random(&self, filename: String, modified: ModifiedTime, exclude_channels: &HashSet<ChannelId>) -> tokio::io::Result<()> {
-        let command = SyncCommand::GetFile(filename, modified, false);
+    fn get_file_from_random(&self,
+                            filename: String,
+                            modified: ModifiedTime,
+                            redistribute: bool,
+                            exclude_channels: &HashSet<ChannelId>) -> tokio::io::Result<()> {
+        let command = SyncCommand::GetFile(filename, modified, redistribute);
         for _ in 0..10 {
             if self.send_command_random(command.clone(), &exclude_channels) {
                 return Ok(());
@@ -446,6 +450,7 @@ impl FileSyncManager {
                 self.get_file_from_random(
                     filename,
                     file_sync_status.request.modified,
+                    file_sync_status.redistribute,
                     &hashset![channel_id]
                 );
             }
