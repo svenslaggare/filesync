@@ -7,7 +7,7 @@ use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 
 use crate::files::{FileRequest, ModifiedTime, FileBlock};
-use crate::filesync::{ChannelId, SyncCommandsSender};
+use crate::filesync::{ChannelId, SyncCommandsSender, SyncCommand};
 
 
 #[derive(Clone)]
@@ -144,17 +144,50 @@ impl FileBlockRequestDispatcher {
         }
     }
 
-    pub fn start_queuing(&self) -> MutexGuard<VecDeque<FileBlockRequest>> {
-        self.queue.lock().unwrap()
+    pub fn dispatch<F: Fn(FileBlockRequest)>(&self, on_failed: F) {
+        let mut request_queue_guard = self.start_queuing();
+
+        while self.can_dispatch() {
+            if let Some(block_request) = request_queue_guard.pop_front() {
+                let command = SyncCommand::GetFileBlock {
+                    filename: block_request.filename.clone(),
+                    block: block_request.block.clone()
+                };
+
+                match block_request.commands_sender.send(command) {
+                    Ok(()) => {
+                        self.start_sending(block_request);
+                    }
+                    Err(command) => {
+                        match command.0 {
+                            SyncCommand::GetFileBlock { .. } => {
+                                on_failed(block_request);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
     }
 
-    pub fn start_sending(&self, request: FileBlockRequest) {
+    fn start_sending(&self, request: FileBlockRequest) {
         self.num_active.fetch_add(1, Ordering::SeqCst);
         self.active_requests
             .lock().unwrap()
             .entry(request.channel_id)
             .or_insert_with(|| HashSet::new())
             .insert((request.filename, request.block));
+    }
+
+    fn can_dispatch(&self) -> bool {
+        self.num_active.load(Ordering::SeqCst) < 10
+    }
+
+    pub fn start_queuing(&self) -> MutexGuard<VecDeque<FileBlockRequest>> {
+        self.queue.lock().unwrap()
     }
 
     pub fn received_block(&self, channel_id: ChannelId, filename: &str, block: &FileBlock) {
@@ -170,9 +203,5 @@ impl FileBlockRequestDispatcher {
 
     pub fn reset_active_count(&self) {
         self.num_active.store(0, Ordering::SeqCst);
-    }
-
-    pub fn can_dispatch(&self) -> bool {
-        self.num_active.load(Ordering::SeqCst) < 10
     }
 }

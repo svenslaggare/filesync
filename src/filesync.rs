@@ -340,32 +340,9 @@ impl FileSyncManager {
     }
 
     fn dispatch_file_block_requests(&self) {
-        let mut request_queue_guard = self.file_block_request_dispatcher.start_queuing();
-
-        while self.file_block_request_dispatcher.can_dispatch() {
-            if let Some(block_request) = request_queue_guard.pop_front() {
-                let command = SyncCommand::GetFileBlock {
-                    filename: block_request.filename.clone(),
-                    block: block_request.block.clone()
-                };
-
-                match block_request.commands_sender.send(command) {
-                    Ok(()) => {
-                        self.file_block_request_dispatcher.start_sending(block_request);
-                    }
-                    Err(command) => {
-                        match command.0 {
-                            SyncCommand::GetFileBlock { filename, .. } => {
-                                self.failed_file_sync(block_request.channel_id, filename);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            } else {
-                break;
-            }
-        }
+        self.file_block_request_dispatcher.dispatch(|block_request| {
+            self.failed_file_sync(block_request.channel_id, block_request.filename);
+        });
     }
 
     async fn look_for_file_changes(&self) {
