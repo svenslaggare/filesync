@@ -168,12 +168,14 @@ impl FileSyncManager {
 
                     let files = files::list_files(&self.folder).await?;
 
-                    commands_sender.send(SyncCommand::SyncFiles(
-                        files
-                            .iter()
-                            .map(|file| (file.path.to_str().unwrap().to_owned(), file.modified))
-                            .collect::<Vec<_>>()
-                    )).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                    commands_sender.send(
+                        SyncCommand::SyncFiles(
+                            files
+                                .iter()
+                                .map(|file| (file.path.to_str().unwrap().to_owned(), file.modified))
+                                .collect::<Vec<_>>()
+                        )
+                    ).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
 
                     self.next_sync();
                 }
