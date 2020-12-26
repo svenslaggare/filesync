@@ -87,7 +87,7 @@ impl std::fmt::Debug for ChannelId {
 }
 
 pub struct FileSyncManager {
-    pub folder: PathBuf,
+    folder: PathBuf,
     files_sync_status: Mutex<FilesSyncStatus>,
     next_commands_channel_id: AtomicU64,
     clients_commands_sender: Mutex<HashMap<ClientId, (ChannelId, SyncCommandsSender)>>,
