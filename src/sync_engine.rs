@@ -1,10 +1,14 @@
 use std::path::{PathBuf, Path};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 
 use crate::files::{FileRequest, ModifiedTime, FileBlock};
+use crate::filesync::{ChannelId, SyncCommandsSender};
+
 
 #[derive(Clone)]
 pub struct FileSyncStatus {
@@ -115,5 +119,60 @@ impl FilesSyncStatus {
 
     pub fn is_done(&self, filename: &str) -> bool {
         self.files.get(filename).map(|file| file.is_done()).unwrap_or(false)
+    }
+}
+
+pub struct FileBlockRequest {
+    pub channel_id: ChannelId,
+    pub commands_sender: SyncCommandsSender,
+    pub filename: String,
+    pub block: FileBlock
+}
+
+pub struct FileBlockRequestDispatcher {
+    queue: Mutex<VecDeque<FileBlockRequest>>,
+    active_requests: Mutex<HashMap<ChannelId, HashSet<(String, FileBlock)>>>,
+    num_active: AtomicI64
+}
+
+impl FileBlockRequestDispatcher {
+    pub fn new() -> FileBlockRequestDispatcher {
+        FileBlockRequestDispatcher {
+            queue: Mutex::new(VecDeque::new()),
+            active_requests: Mutex::new(HashMap::new()),
+            num_active: AtomicI64::new(0),
+        }
+    }
+
+    pub fn start_queuing(&self) -> MutexGuard<VecDeque<FileBlockRequest>> {
+        self.queue.lock().unwrap()
+    }
+
+    pub fn start_sending(&self, request: FileBlockRequest) {
+        self.num_active.fetch_add(1, Ordering::SeqCst);
+        self.active_requests
+            .lock().unwrap()
+            .entry(request.channel_id)
+            .or_insert_with(|| HashSet::new())
+            .insert((request.filename, request.block));
+    }
+
+    pub fn received_block(&self, channel_id: ChannelId, filename: &str, block: &FileBlock) {
+        self.num_active.fetch_sub(1, Ordering::SeqCst);
+        if let Some(channel_blocks) = self.active_requests.lock().unwrap().get_mut(&channel_id) {
+            channel_blocks.remove(&(filename.to_owned(), block.clone()));
+        }
+    }
+
+    pub fn remove_active(&self, channel_id: ChannelId) -> Option<HashSet<(String, FileBlock)>> {
+        self.active_requests.lock().unwrap().remove(&channel_id)
+    }
+
+    pub fn reset_active_count(&self) {
+        self.num_active.store(0, Ordering::SeqCst);
+    }
+
+    pub fn can_dispatch(&self) -> bool {
+        self.num_active.load(Ordering::SeqCst) < 10
     }
 }

@@ -232,6 +232,15 @@ pub async fn write_file_block(path: &Path,
     Ok(())
 }
 
+pub async fn make_active(tmp_write_path: &Path, path: &Path) -> tokio::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    tokio::fs::rename(tmp_write_path, path).await?;
+    Ok(())
+}
+
 pub fn hash_file_block(offset: u64, content: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.input(&offset.to_le_bytes());
