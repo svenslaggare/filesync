@@ -210,10 +210,13 @@ async fn start_sync_server(file_sync_manager: Arc<FileSyncManager>) -> SocketAdd
 
                 let file_sync_manager_clone = file_sync_manager.clone();
                 tokio::spawn(async move {
+                    let channel_id = file_sync_manager_clone.next_commands_channel_id();
                     if let Err(result) = file_sync_manager_clone.run(sync_client,
+                                                                     channel_id,
                                                                      mpsc::unbounded_channel(),
                                                                      false).await {
                         println!("Sync client error: {:?}", result);
+                        file_sync_manager_clone.remove_active_requests(channel_id);
                     }
                 });
             } else {
@@ -232,11 +235,14 @@ async fn start_sync_client(client: TrackerClient,
 
     tokio::spawn(async move {
         let commands_channel = mpsc::unbounded_channel();
-        file_sync_manager.add_client(client.id, commands_channel.0.clone());
+        let channel_id = file_sync_manager.next_commands_channel_id();
+        file_sync_manager.add_client(client.id, channel_id, commands_channel.0.clone());
         if let Err(result) = file_sync_manager.run(sync_client,
+                                                   channel_id,
                                                    commands_channel,
                                                    sync).await {
             println!("Sync client error: {:?}", result);
+            file_sync_manager.remove_active_requests(channel_id);
         }
     });
 

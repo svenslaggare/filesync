@@ -118,7 +118,7 @@ pub async fn has_file(path: &Path, request_time: &ModifiedTime) -> bool {
     }).unwrap_or(false)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileBlock {
     pub number: u64,
     pub size: u64

@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::{Mutex, Arc};
 use std::iter::FromIterator;
 use std::sync::atomic::{AtomicI64, Ordering, AtomicU64};
+use std::ops::Deref;
 
 use rand::{thread_rng};
 use rand::seq::SliceRandom;
@@ -19,7 +20,6 @@ use crate::{files, sync};
 use crate::sync::{SyncAction, FileChangesFinder, DeleteLog};
 use crate::tracker::ClientId;
 use crate::sync_status::FilesSyncStatus;
-use std::ops::Deref;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
@@ -51,16 +51,57 @@ impl SyncCommand {
     }
 }
 
+impl std::fmt::Display for SyncCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncCommand::RequestFileSync(_) => write!(f, "RequestFileSync"),
+            SyncCommand::AcceptedFileSync(_) => write!(f, "AcceptedFileSync"),
+            SyncCommand::SyncFiles { .. } => write!(f, "SyncFiles"),
+            SyncCommand::GetFile(_, _, _) => write!(f, "GetFile"),
+            SyncCommand::GetFileDenied(_, _) => write!(f, "GetFileDenied"),
+            SyncCommand::SendFile(_, _) => write!(f, "SendFile"),
+            SyncCommand::StartSyncFile { .. } => write!(f, "StartSyncFile"),
+            SyncCommand::GetFileBlock { .. } => write!(f, "GetFileBlock"),
+            SyncCommand::FileBlock { .. } => write!(f, "FileBlock"),
+            SyncCommand::DeleteFile(_, _) => write!(f, "DeleteFile"),
+        }
+    }
+}
+
 pub type SyncCommandsSender = mpsc::UnboundedSender<SyncCommand>;
 pub type SyncCommandsReceiver = mpsc::UnboundedReceiver<SyncCommand>;
+
+#[derive(Copy, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChannelId(pub u64);
+
+impl std::fmt::Display for ChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Debug for ChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+struct FileBlockRequest {
+    channel_id: ChannelId,
+    commands_sender: SyncCommandsSender,
+    filename: String,
+    block: FileBlock
+}
 
 pub struct FileSyncManager {
     pub folder: PathBuf,
     files_sync_status: Mutex<FilesSyncStatus>,
-    clients_commands_sender: Mutex<HashMap<ClientId, SyncCommandsSender>>,
+    next_commands_channel_id: AtomicU64,
+    clients_commands_sender: Mutex<HashMap<ClientId, (ChannelId, SyncCommandsSender)>>,
     file_changes_finder: Mutex<FileChangesFinder>,
     delete_log: tokio::sync::Mutex<DeleteLog>,
-    request_file_block_queue: Mutex<VecDeque<(SyncCommandsSender, SyncCommand)>>,
+    request_file_block_queue: Mutex<VecDeque<FileBlockRequest>>,
+    active_file_block_requests: Mutex<HashMap<ChannelId, HashSet<(String, FileBlock)>>>,
     num_active_file_block_requests: AtomicI64,
     next_sync_request_id: AtomicU64,
     sync_requests: Mutex<HashSet<u64>>
@@ -72,9 +113,11 @@ impl FileSyncManager {
             folder: folder.clone(),
             files_sync_status: Mutex::new(FilesSyncStatus::new()),
             clients_commands_sender: Mutex::new(HashMap::new()),
+            next_commands_channel_id: AtomicU64::new(1),
             file_changes_finder: Mutex::new(FileChangesFinder::new()),
             delete_log:  tokio::sync::Mutex::new(DeleteLog::new(folder.clone())),
             request_file_block_queue: Mutex::new(VecDeque::new()),
+            active_file_block_requests: Mutex::new(HashMap::new()),
             num_active_file_block_requests: AtomicI64::new(0),
             next_sync_request_id: AtomicU64::new(1),
             sync_requests: Mutex::new(HashSet::new())
@@ -83,6 +126,7 @@ impl FileSyncManager {
 
     pub async fn run(&self,
                      client: TcpStream,
+                     channel_id: ChannelId,
                      commands_channel: (SyncCommandsSender, SyncCommandsReceiver),
                      initial_sync: bool) -> tokio::io::Result<()> {
         let (mut commands_sender, mut commands_receiver) = commands_channel;
@@ -105,16 +149,18 @@ impl FileSyncManager {
             let command = SyncCommand::receive_command(&mut client_reader).await?;
             self.handle(
                 destination_address,
+                channel_id,
                 &mut commands_sender,
                 command
             ).await?;
         }
     }
 
-    pub async fn handle(&self,
-                        destination_address: SocketAddr,
-                        commands_sender: &mut SyncCommandsSender,
-                        command: SyncCommand) -> tokio::io::Result<()> {
+    async fn handle(&self,
+                    destination_address: SocketAddr,
+                    channel_id: ChannelId,
+                    commands_sender: &mut SyncCommandsSender,
+                    command: SyncCommand) -> tokio::io::Result<()> {
         match command {
             SyncCommand::RequestFileSync(id) => {
                 if !self.files_sync_status.lock().unwrap().any_active() {
@@ -125,7 +171,7 @@ impl FileSyncManager {
                 }
             }
             SyncCommand::AcceptedFileSync(id) => {
-                println!("Got sync request id #{}", id);
+                println!("Got sync request #{}", id);
 
                 let sync = self.sync_requests.lock().unwrap().insert(id);
                 if sync {
@@ -152,7 +198,7 @@ impl FileSyncManager {
                     .map(|file| File::new(PathBuf::from(file.0), file.1))
                     .collect::<Vec<_>>();
 
-                for action in sync::compute_sync_actions(files, other_files, &self.delete_log.lock().await.deref()) {
+                for action in sync::full_sync(files, other_files, &self.delete_log.lock().await.deref()) {
                     match action {
                         SyncAction::GetFile(filename, modified) => {
                             println!("Get file: {}", filename);
@@ -186,10 +232,10 @@ impl FileSyncManager {
                 }
             }
             SyncCommand::GetFileDenied(filename, modified) => {
-                self.get_file_from_random(filename, modified)?;
+                self.get_file_from_random(filename, modified, &HashSet::new())?;
             },
             SyncCommand::SendFile(filename, modified) => {
-                self.get_file_from_random(filename, modified)?;
+                self.get_file_from_random(filename, modified, &HashSet::new())?;
             },
             SyncCommand::StartSyncFile { filename, request, redistribute } => {
                 if files::is_remote_newer(&self.folder.join(&filename), &request.modified).await {
@@ -204,13 +250,12 @@ impl FileSyncManager {
                         );
 
                         for block in self.start_file_sync(&filename, request, redistribute) {
-                            request_file_block_queue_guard.push_back((
-                                commands_sender.clone(),
-                                SyncCommand::GetFileBlock {
-                                    filename: filename.clone(),
-                                    block,
-                                }
-                            ));
+                            request_file_block_queue_guard.push_back(FileBlockRequest {
+                                channel_id,
+                                commands_sender: commands_sender.clone(),
+                                filename: filename.clone(),
+                                block
+                            });
                         }
                     } else {
                         println!("Sync request for file {} is already ongoing.", filename);
@@ -239,7 +284,7 @@ impl FileSyncManager {
                             &content,
                         ).await?;
 
-                        self.received_file_block(&filename, &block, content.len());
+                        self.received_file_block(channel_id, &filename, &block, content.len());
                         if self.try_complete_file_sync(&filename, modified).await? {
                             self.send_commands_all(SyncCommand::SendFile(filename, modified));
                         }
@@ -309,22 +354,25 @@ impl FileSyncManager {
         let mut request_file_block_queue_guard = self.request_file_block_queue.lock().unwrap();
 
         while self.num_active_file_block_requests.load(Ordering::SeqCst) < 10 {
-            if let Some((commands_sender, command)) = request_file_block_queue_guard.pop_front() {
-                match commands_sender.send(command) {
+            if let Some(block_request) = request_file_block_queue_guard.pop_front() {
+                let command = SyncCommand::GetFileBlock {
+                    filename: block_request.filename.clone(),
+                    block: block_request.block.clone()
+                };
+
+                match block_request.commands_sender.send(command) {
                     Ok(()) => {
                         self.num_active_file_block_requests.fetch_add(1, Ordering::SeqCst);
+                        self.active_file_block_requests
+                            .lock().unwrap()
+                            .entry(block_request.channel_id)
+                            .or_insert_with(|| HashSet::new())
+                            .insert((block_request.filename, block_request.block));
                     }
                     Err(command) => {
                         match command.0 {
                             SyncCommand::GetFileBlock { filename, .. } => {
-                                if let Some(file_sync_status) = self.files_sync_status.lock().unwrap().remove_failed(&filename) {
-                                    self.num_active_file_block_requests.store(0, Ordering::SeqCst);
-                                    println!("Failed to sync file '{}'.", filename);
-
-                                    #[allow(unused_must_use)] {
-                                        self.get_file_from_random(filename, file_sync_status.request.modified);
-                                    }
-                                }
+                                self.failed_file_sync(block_request.channel_id, filename);
                             }
                             _ => {}
                         }
@@ -366,12 +414,23 @@ impl FileSyncManager {
         self.files_sync_status.lock().unwrap().add(&self.folder, filename, request, redistribute)
     }
 
-    fn received_file_block(&self, filename: &str, block: &FileBlock, content_size: usize) {
+    fn received_file_block(&self, channel_id: ChannelId, filename: &str, block: &FileBlock, content_size: usize) {
         let mut file_sync_status_guard = self.files_sync_status.lock().unwrap();
         if let Some(file_sync_status) = file_sync_status_guard.get_mut(filename) {
-            file_sync_status.done_blocks.insert(block.number);
+            let added = file_sync_status.done_blocks.insert(block.number);
 
-            self.num_active_file_block_requests.fetch_sub(1, Ordering::SeqCst);
+            if added {
+                self.num_active_file_block_requests.fetch_sub(1, Ordering::SeqCst);
+                if let Some(channel_blocks) = self.active_file_block_requests.lock().unwrap().get_mut(&channel_id) {
+                    channel_blocks.remove(&(filename.to_owned(), block.clone()));
+                }
+            } else {
+                println!(
+                    "Received file block: {}/{} a second time",
+                    filename,
+                    block.number
+                );
+            }
 
             println!(
                 "Received file block: {}/{} ({} bytes), got {}/{}",
@@ -414,10 +473,10 @@ impl FileSyncManager {
         }
     }
 
-    fn get_file_from_random(&self, filename: String, modified: ModifiedTime) -> tokio::io::Result<()> {
+    fn get_file_from_random(&self, filename: String, modified: ModifiedTime, exclude_channels: &HashSet<ChannelId>) -> tokio::io::Result<()> {
         let command = SyncCommand::GetFile(filename, modified, false);
         for _ in 0..10 {
-            if self.send_command_random(command.clone()) {
+            if self.send_command_random(command.clone(), &exclude_channels) {
                 return Ok(());
             }
         }
@@ -425,16 +484,43 @@ impl FileSyncManager {
         return Err(tokio::io::Error::from(ErrorKind::Other));
     }
 
-    pub fn add_client(&self, client_id: ClientId, commands_sender: SyncCommandsSender) {
-        self.clients_commands_sender.lock().unwrap().insert(client_id, commands_sender);
+    fn failed_file_sync(&self, channel_id: ChannelId, filename: String) {
+        if let Some(file_sync_status) = self.files_sync_status.lock().unwrap().remove_failed(&filename) {
+            self.num_active_file_block_requests.store(0, Ordering::SeqCst);
+            println!("Failed to sync file '{}'.", filename);
+
+            #[allow(unused_must_use)] {
+                self.get_file_from_random(
+                    filename,
+                    file_sync_status.request.modified,
+                    &hashset![channel_id]
+                );
+            }
+        }
+    }
+
+    pub fn next_commands_channel_id(&self) -> ChannelId {
+        ChannelId(self.next_commands_channel_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    pub fn add_client(&self, client_id: ClientId, channel_id: ChannelId, commands_sender: SyncCommandsSender) {
+        self.clients_commands_sender.lock().unwrap().insert(client_id, (channel_id, commands_sender));
     }
 
     pub fn remove_client(&self, client_id: ClientId) {
         self.clients_commands_sender.lock().unwrap().remove(&client_id);
     }
 
+    pub fn remove_active_requests(&self, channel_id: ChannelId) {
+        if let Some(requests) = self.active_file_block_requests.lock().unwrap().remove(&channel_id) {
+            for request in requests {
+                self.failed_file_sync(channel_id, request.0);
+            }
+        }
+    }
+
     pub fn send_commands_all(&self, command: SyncCommand) {
-        for commands_sender in self.clients_commands_sender.lock().unwrap().values() {
+        for (_, commands_sender) in self.clients_commands_sender.lock().unwrap().values() {
             if let Err(err) = commands_sender.send(command.clone()) {
                 println!("{:?}", err);
             }
@@ -451,7 +537,7 @@ impl FileSyncManager {
             let count = 1;
 
             for client in &keys[..count] {
-                if let Err(err) = clients_commands_sender_guard[*client].send(command.clone()) {
+                if let Err(err) = clients_commands_sender_guard[*client].1.send(command.clone()) {
                     println!("{:?}", err);
                 }
             }
@@ -462,15 +548,21 @@ impl FileSyncManager {
         }
     }
 
-    pub fn send_command_random(&self, command: SyncCommand) -> bool {
+    pub fn send_command_random(&self, command: SyncCommand, exclude_channels: &HashSet<ChannelId>) -> bool {
         let clients_commands_sender_guard = self.clients_commands_sender.lock().unwrap();
 
         if !clients_commands_sender_guard.is_empty() {
             let mut keys = clients_commands_sender_guard.keys().collect::<Vec<_>>();
             keys.shuffle(&mut thread_rng());
 
-            let key = keys[0];
-            clients_commands_sender_guard[key].send(command.clone()).is_ok()
+            for key in keys {
+                let (channel_id, commands_sender) = &clients_commands_sender_guard[key];
+                if !exclude_channels.contains(channel_id) {
+                    return commands_sender.send(command.clone()).is_ok()
+                }
+            }
+
+            false
         } else {
             false
         }

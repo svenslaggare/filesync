@@ -12,9 +12,9 @@ pub enum SyncAction {
     DeleteFile(String, ModifiedTime)
 }
 
-pub fn compute_sync_actions(files: Vec<File>,
-                            other_files: Vec<File>,
-                            delete_log: &DeleteLog) -> Vec<SyncAction> {
+pub fn full_sync(files: Vec<File>,
+                 other_files: Vec<File>,
+                 delete_log: &DeleteLog) -> Vec<SyncAction> {
     let files_map = HashMap::<PathBuf, &File>::from_iter(files.iter().map(|file| (file.path.clone(), file)));
     let other_files_map = HashMap::<PathBuf, &File>::from_iter(other_files.iter().map(|file| (file.path.clone(), file)));
 
