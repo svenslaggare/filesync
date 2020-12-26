@@ -238,7 +238,13 @@ impl FileSyncManager {
                             redistribute
                         );
 
-                        let blocks = self.start_file_sync(&filename, request, redistribute);
+                        let blocks = self.files_sync_status.lock().unwrap().add(
+                            &self.folder,
+                            &filename,
+                            request,
+                            redistribute
+                        );
+                        
                         self.file_block_request_dispatcher.enqueue(
                             channel_id,
                             commands_sender.clone(),
@@ -368,10 +374,6 @@ impl FileSyncManager {
                 self.send_commands_all(SyncCommand::DeleteFile(filename, deleted_file.modified));
             }
         }
-    }
-
-    pub fn start_file_sync(&self, filename: &str, request: FileRequest, redistribute: bool) -> Vec<FileBlock> {
-        self.files_sync_status.lock().unwrap().add(&self.folder, filename, request, redistribute)
     }
 
     fn received_file_block(&self, channel_id: ChannelId, filename: &str, block: &FileBlock, content_size: usize) {
