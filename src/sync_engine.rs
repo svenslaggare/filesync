@@ -1,6 +1,6 @@
 use std::path::{PathBuf, Path};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use rand::{thread_rng, Rng};
@@ -145,7 +145,7 @@ impl FileBlockRequestDispatcher {
     }
 
     pub fn dispatch<F: Fn(FileBlockRequest)>(&self, on_failed: F) {
-        let mut request_queue_guard = self.start_queuing();
+        let mut request_queue_guard = self.queue.lock().unwrap();
 
         while self.can_dispatch() {
             if let Some(block_request) = request_queue_guard.pop_front() {
@@ -186,8 +186,21 @@ impl FileBlockRequestDispatcher {
         self.num_active.load(Ordering::SeqCst) < 10
     }
 
-    pub fn start_queuing(&self) -> MutexGuard<VecDeque<FileBlockRequest>> {
-        self.queue.lock().unwrap()
+    pub fn enqueue(&self,
+                   channel_id: ChannelId,
+                   commands_sender: SyncCommandsSender,
+                   filename: String,
+                   blocks: Vec<FileBlock>) {
+        let mut request_queue_guard = self.queue.lock().unwrap();
+
+        for block in blocks {
+            request_queue_guard.push_back(FileBlockRequest {
+                channel_id,
+                commands_sender: commands_sender.clone(),
+                filename: filename.clone(),
+                block
+            });
+        }
     }
 
     pub fn received_block(&self, channel_id: ChannelId, filename: &str, block: &FileBlock) {

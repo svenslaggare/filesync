@@ -19,7 +19,7 @@ use crate::files::{FileBlock, File, FileRequest, hash_file_block, ModifiedTime};
 use crate::{files, sync};
 use crate::sync::{SyncAction, FileChangesFinder, DeleteLog};
 use crate::tracker::ClientId;
-use crate::sync_engine::{FilesSyncStatus, FileBlockRequestDispatcher, FileBlockRequest};
+use crate::sync_engine::{FilesSyncStatus, FileBlockRequestDispatcher};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
@@ -229,8 +229,6 @@ impl FileSyncManager {
             SyncCommand::StartSyncFile { filename, request, redistribute } => {
                 if files::is_remote_newer(&self.folder.join(&filename), &request.modified).await {
                     if !self.files_sync_status.lock().unwrap().is_syncing(&filename) {
-                        let mut request_queue_guard = self.file_block_request_dispatcher.start_queuing();
-
                         println!(
                             "Starting sync of file: {} ({} bytes), redistribute: {}",
                             filename,
@@ -238,14 +236,13 @@ impl FileSyncManager {
                             redistribute
                         );
 
-                        for block in self.start_file_sync(&filename, request, redistribute) {
-                            request_queue_guard.push_back(FileBlockRequest {
-                                channel_id,
-                                commands_sender: commands_sender.clone(),
-                                filename: filename.clone(),
-                                block
-                            });
-                        }
+                        let blocks = self.start_file_sync(&filename, request, redistribute);
+                        self.file_block_request_dispatcher.enqueue(
+                            channel_id,
+                            commands_sender.clone(),
+                            filename,
+                            blocks
+                        );
                     } else {
                         println!("Sync request for file {} is already ongoing.", filename);
                     }
