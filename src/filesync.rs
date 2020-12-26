@@ -88,11 +88,11 @@ impl std::fmt::Debug for ChannelId {
 
 pub struct FileSyncManager {
     folder: PathBuf,
-    files_sync_status: Mutex<FilesSyncStatus>,
     next_commands_channel_id: AtomicU64,
     clients_commands_sender: Mutex<HashMap<ClientId, (ChannelId, SyncCommandsSender)>>,
     file_changes_finder: Mutex<FileChangesFinder>,
     delete_log: tokio::sync::Mutex<DeleteLog>,
+    files_sync_status: Mutex<FilesSyncStatus>,
     file_block_request_dispatcher: FileBlockRequestDispatcher,
     next_sync_request_id: AtomicU64,
     sync_requests: Mutex<HashSet<u64>>
@@ -102,11 +102,11 @@ impl FileSyncManager {
     pub fn new(folder: PathBuf) -> FileSyncManager {
         FileSyncManager {
             folder: folder.clone(),
-            files_sync_status: Mutex::new(FilesSyncStatus::new()),
             clients_commands_sender: Mutex::new(HashMap::new()),
             next_commands_channel_id: AtomicU64::new(1),
             file_changes_finder: Mutex::new(FileChangesFinder::new()),
             delete_log:  tokio::sync::Mutex::new(DeleteLog::new(folder.clone())),
+            files_sync_status: Mutex::new(FilesSyncStatus::new()),
             file_block_request_dispatcher: FileBlockRequestDispatcher::new(),
             next_sync_request_id: AtomicU64::new(1),
             sync_requests: Mutex::new(HashSet::new())
