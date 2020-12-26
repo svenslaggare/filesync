@@ -165,6 +165,17 @@ impl DeleteLog {
 
     pub async fn save(&self) -> tokio::io::Result<()> {
         let path = self.folder.join(".filesync").join("delete_log.json");
+
+        DeleteLog::save_internal(
+            path,
+            &self.files
+        ).await?;
+
+        Ok(())
+    }
+
+    async fn save_internal(path: PathBuf,
+                           files: &HashMap<(String, ModifiedTime), std::time::SystemTime>) -> tokio::io::Result<()> {
         if let Some(parent) = path.parent() {
             if !path.exists() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -174,7 +185,7 @@ impl DeleteLog {
         tokio::fs::write(
             path,
             serde_json::to_string(
-                &self.files
+                &files
                     .iter()
                     .map(|(key, value)| DeleteLogEntry {
                         filename: key.0.clone(),
@@ -192,6 +203,23 @@ impl DeleteLog {
         let time_now = std::time::SystemTime::now();
         self.files.retain(|_, value| {
             time_now.duration_since(*value).unwrap().as_secs_f64() <= 60.0
+        });
+    }
+}
+
+impl Drop for DeleteLog {
+    fn drop(&mut self) {
+        let mut files = HashMap::new();
+        std::mem::swap(&mut files, &mut self.files);
+        let path = self.folder.join(".filesync").join("delete_log.json");
+
+        tokio::spawn(async move {
+            #[allow(unused_must_use)] {
+                DeleteLog::save_internal(
+                    path,
+                    &files
+                ).await;
+            }
         });
     }
 }
