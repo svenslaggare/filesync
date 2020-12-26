@@ -306,7 +306,7 @@ impl FileSyncManager {
         Ok(())
     }
 
-    pub fn start_background_tasks(self: &Arc<FileSyncManager>) {
+    pub fn start_background_tasks(self: &Arc<Self>) {
         let file_sync_manager = self.clone();
         tokio::spawn(async move {
             file_sync_manager.look_for_file_changes().await;
@@ -381,22 +381,22 @@ impl FileSyncManager {
 
             if added {
                 self.file_block_request_dispatcher.received_block(channel_id, filename, block);
+
+                println!(
+                    "Received file block: {}/{} ({} bytes), got {}/{}",
+                    filename,
+                    block.number,
+                    content_size,
+                    file_sync_status.done_blocks.len(),
+                    file_sync_status.request.num_blocks
+                );
             } else {
                 println!(
-                    "Received file block: {}/{} a second time",
+                    "Received file block: {}/{} again",
                     filename,
                     block.number
                 );
             }
-
-            println!(
-                "Received file block: {}/{} ({} bytes), got {}/{}",
-                filename,
-                block.number,
-                content_size,
-                file_sync_status.done_blocks.len(),
-                file_sync_status.request.num_blocks
-            );
         }
     }
 
