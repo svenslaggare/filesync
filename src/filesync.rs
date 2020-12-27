@@ -429,14 +429,10 @@ impl FileSyncManager {
                             modified: ModifiedTime,
                             redistribute: bool,
                             exclude_channels: &HashSet<ChannelId>) -> tokio::io::Result<()> {
-        let command = SyncCommand::GetFile(filename, modified, redistribute);
-        for _ in 0..10 {
-            if self.clients_manager.send_command_random(command.clone(), &exclude_channels) {
-                return Ok(());
-            }
-        }
-
-        return Err(tokio::io::Error::from(ErrorKind::Other));
+        self.clients_manager.send_command_random(
+            SyncCommand::GetFile(filename, modified, redistribute),
+            exclude_channels
+        )
     }
 
     fn failed_file_sync(&self, channel_id: ChannelId, filename: String) {
