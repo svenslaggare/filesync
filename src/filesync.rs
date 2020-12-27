@@ -367,10 +367,11 @@ impl FileSyncManager {
                 self.start_file_sync_all(filename, true).await;
             }
 
+            let mut delete_log_guard = self.delete_log.lock().await;
             for deleted_file in file_changes.deleted {
                 let filename = deleted_file.path.to_str().unwrap().to_owned();
                 println!("Deleted file '{}'", filename);
-                self.delete_log.lock().await.add_entry(&filename, deleted_file.modified);
+                delete_log_guard.add_entry(&filename, deleted_file.modified);
                 self.send_commands_all(SyncCommand::DeleteFile(filename, deleted_file.modified));
             }
         }
@@ -494,13 +495,18 @@ impl FileSyncManager {
             // let count = thread_rng().gen_range(1..(keys.len() + 1));
             let count = 1;
 
-            for client in &keys[..count] {
-                if let Err(err) = clients_commands_sender_guard[*client].1.send(command.clone()) {
-                    println!("{:?}", err);
+            let mut used_count = 0;
+            for client in &keys {
+                if clients_commands_sender_guard[*client].1.send(command.clone()).is_ok() {
+                    used_count += 1;
+                }
+
+                if used_count >= count {
+                    break;
                 }
             }
 
-            count
+            used_count
         } else {
             0
         }
@@ -516,7 +522,9 @@ impl FileSyncManager {
             for key in keys {
                 let (channel_id, commands_sender) = &clients_commands_sender_guard[key];
                 if !exclude_channels.contains(channel_id) {
-                    return commands_sender.send(command.clone()).is_ok()
+                    if commands_sender.send(command.clone()).is_ok() {
+                        return true;
+                    }
                 }
             }
 
