@@ -9,7 +9,6 @@ use rand::distributions::Alphanumeric;
 use crate::files::{FileRequest, ModifiedTime, FileBlock};
 use crate::filesync::{ChannelId, SyncCommandsSender, SyncCommand};
 
-
 #[derive(Clone)]
 pub struct FileSyncStatus {
     pub tmp_write_path: PathBuf,
@@ -123,14 +122,13 @@ impl FilesSyncStatus {
 }
 
 pub struct FileBlockRequest {
-    pub channel_id: ChannelId,
     pub commands_sender: SyncCommandsSender,
     pub filename: String,
     pub block: FileBlock
 }
 
 pub struct FileBlockRequestDispatcher {
-    queue: Mutex<VecDeque<FileBlockRequest>>,
+    queue: Mutex<HashMap<ChannelId, VecDeque<FileBlockRequest>>>,
     active_requests: Mutex<HashMap<ChannelId, HashSet<(String, FileBlock)>>>,
     num_active: AtomicI64
 }
@@ -138,46 +136,55 @@ pub struct FileBlockRequestDispatcher {
 impl FileBlockRequestDispatcher {
     pub fn new() -> FileBlockRequestDispatcher {
         FileBlockRequestDispatcher {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(HashMap::new()),
             active_requests: Mutex::new(HashMap::new()),
             num_active: AtomicI64::new(0),
         }
     }
 
-    pub fn dispatch<F: Fn(FileBlockRequest)>(&self, on_failed: F) {
+    pub fn dispatch<F: Fn(ChannelId, FileBlockRequest)>(&self, on_failed: F) {
         let mut request_queue_guard = self.queue.lock().unwrap();
 
         while self.can_dispatch() {
-            if let Some(block_request) = request_queue_guard.pop_front() {
-                let command = SyncCommand::GetFileBlock {
-                    filename: block_request.filename.clone(),
-                    block: block_request.block.clone()
-                };
+            let mut any_left = false;
+            for (channel_id, channel_queue) in request_queue_guard.iter_mut() {
+                while let Some(block_request) = channel_queue.pop_front() {
+                    any_left = true;
+                    let command = SyncCommand::GetFileBlock {
+                        filename: block_request.filename.clone(),
+                        block: block_request.block.clone()
+                    };
 
-                match block_request.commands_sender.send(command) {
-                    Ok(()) => {
-                        self.start_sending(block_request);
-                    }
-                    Err(command) => {
-                        match command.0 {
-                            SyncCommand::GetFileBlock { .. } => {
-                                on_failed(block_request);
+                    match block_request.commands_sender.send(command) {
+                        Ok(()) => {
+                            self.start_sending(*channel_id, block_request);
+                            break;
+                        }
+                        Err(command) => {
+                            match command.0 {
+                                SyncCommand::GetFileBlock { .. } => {
+                                    on_failed(*channel_id, block_request);
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
-            } else {
+            }
+
+            if !any_left {
                 break;
             }
         }
+
+        request_queue_guard.retain(|_, channel_queue| !channel_queue.is_empty());
     }
 
-    fn start_sending(&self, request: FileBlockRequest) {
+    fn start_sending(&self, channel_id: ChannelId, request: FileBlockRequest) {
         self.num_active.fetch_add(1, Ordering::SeqCst);
         self.active_requests
             .lock().unwrap()
-            .entry(request.channel_id)
+            .entry(channel_id)
             .or_insert_with(|| HashSet::new())
             .insert((request.filename, request.block));
     }
@@ -192,10 +199,10 @@ impl FileBlockRequestDispatcher {
                    filename: String,
                    blocks: Vec<FileBlock>) {
         let mut request_queue_guard = self.queue.lock().unwrap();
+        let channel_request_queue = request_queue_guard.entry(channel_id).or_insert_with(|| VecDeque::new());
 
         for block in blocks {
-            request_queue_guard.push_back(FileBlockRequest {
-                channel_id,
+            channel_request_queue.push_back(FileBlockRequest {
                 commands_sender: commands_sender.clone(),
                 filename: filename.clone(),
                 block
@@ -210,11 +217,12 @@ impl FileBlockRequestDispatcher {
         }
     }
 
-    pub fn remove_active(&self, channel_id: ChannelId) -> Option<HashSet<(String, FileBlock)>> {
-        self.active_requests.lock().unwrap().remove(&channel_id)
-    }
+    pub fn remove_active_requests(&self, channel_id: ChannelId) -> Option<HashSet<(String, FileBlock)>> {
+        let active_requests = self.active_requests.lock().unwrap().remove(&channel_id);
+        if let Some(active_requests) = active_requests.as_ref() {
+            self.num_active.fetch_sub(active_requests.len() as i64, Ordering::SeqCst);
+        }
 
-    pub fn reset_active_count(&self) {
-        self.num_active.store(0, Ordering::SeqCst);
+        active_requests
     }
 }

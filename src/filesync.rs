@@ -244,7 +244,7 @@ impl FileSyncManager {
                             request,
                             redistribute
                         );
-                        
+
                         self.file_block_request_dispatcher.enqueue(
                             channel_id,
                             commands_sender.clone(),
@@ -345,8 +345,8 @@ impl FileSyncManager {
     }
 
     fn dispatch_file_block_requests(&self) {
-        self.file_block_request_dispatcher.dispatch(|block_request| {
-            self.failed_file_sync(block_request.channel_id, block_request.filename);
+        self.file_block_request_dispatcher.dispatch(|channel_id, block_request| {
+            self.failed_file_sync(channel_id, block_request.filename);
         });
     }
 
@@ -444,7 +444,6 @@ impl FileSyncManager {
 
     fn failed_file_sync(&self, channel_id: ChannelId, filename: String) {
         if let Some(file_sync_status) = self.files_sync_status.lock().unwrap().remove_failed(&filename) {
-            self.file_block_request_dispatcher.reset_active_count();
             println!("Failed to sync file '{}'.", filename);
 
             #[allow(unused_must_use)] {
@@ -471,7 +470,7 @@ impl FileSyncManager {
     }
 
     pub fn remove_active_requests(&self, channel_id: ChannelId) {
-        if let Some(requests) = self.file_block_request_dispatcher.remove_active(channel_id) {
+        if let Some(requests) = self.file_block_request_dispatcher.remove_active_requests(channel_id) {
             for request in requests {
                 self.failed_file_sync(channel_id, request.0);
             }
