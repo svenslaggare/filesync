@@ -352,13 +352,13 @@ impl FileSyncManager {
 
     async fn look_for_file_changes(&self) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        let last_files = list_files_as_map(&self.folder).await;
+        let last_files = files::list_files_as_map(&self.folder).await;
         self.file_changes_finder.lock().unwrap().set_last_files(last_files);
 
         loop {
             interval.tick().await;
 
-            let new_files = list_files_as_map(&self.folder).await;
+            let new_files = files::list_files_as_map(&self.folder).await;
 
             let file_changes = self.file_changes_finder.lock().unwrap().find_changes(new_files);
             for modified_file in file_changes.modified {
@@ -525,12 +525,4 @@ impl FileSyncManager {
             false
         }
     }
-}
-
-async fn list_files_as_map(folder: &Path) -> HashMap<PathBuf, File> {
-    create_files_map(files::list_files(&folder).await.unwrap_or_else(|_| Vec::new()))
-}
-
-fn create_files_map(files: Vec<File>) -> HashMap<PathBuf, File> {
-    HashMap::from_iter(files.into_iter().map(|file| (file.path.clone(), file)))
 }

@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::iter::FromIterator;
 
 use crypto::sha2::Sha256;
 use crypto::digest::Digest;
@@ -100,6 +102,11 @@ pub async fn list_files(folder: &Path) -> tokio::io::Result<Vec<File>> {
     }
 
     Ok(files)
+}
+
+pub async fn list_files_as_map(folder: &Path) -> HashMap<PathBuf, File> {
+    let files = list_files(&folder).await.unwrap_or_else(|_| Vec::new());
+    HashMap::from_iter(files.into_iter().map(|file| (file.path.clone(), file)))
 }
 
 pub async fn is_remote_newer(path: &Path, request_time: &ModifiedTime) -> bool {

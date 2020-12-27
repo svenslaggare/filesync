@@ -121,7 +121,7 @@ impl FilesSyncStatus {
     }
 }
 
-pub struct FileBlocksRequest {
+struct FileBlocksRequest {
     pub commands_sender: SyncCommandsSender,
     pub filename: String,
     pub blocks: VecDeque<FileBlock>
