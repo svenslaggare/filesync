@@ -1,5 +1,5 @@
 use std::path::{PathBuf, Path};
-use std::collections::{HashSet};
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Mutex, Arc};
 use std::iter::FromIterator;
@@ -92,7 +92,8 @@ pub struct FileSyncManager {
     files_sync_status: Mutex<FilesSyncStatus>,
     file_block_request_dispatcher: FileBlockRequestDispatcher,
     next_sync_request_id: AtomicU64,
-    sync_requests: Mutex<HashSet<u64>>
+    outgoing_sync_requests: Mutex<HashSet<u64>>,
+    incoming_sync_requests: Mutex<VecDeque<(SyncCommandsSender, u64)>>
 }
 
 impl FileSyncManager {
@@ -105,7 +106,8 @@ impl FileSyncManager {
             files_sync_status: Mutex::new(FilesSyncStatus::new()),
             file_block_request_dispatcher: FileBlockRequestDispatcher::new(),
             next_sync_request_id: AtomicU64::new(1),
-            sync_requests: Mutex::new(HashSet::new())
+            outgoing_sync_requests: Mutex::new(HashSet::new()),
+            incoming_sync_requests: Mutex::new(VecDeque::new())
         }
     }
 
@@ -148,17 +150,12 @@ impl FileSyncManager {
                     command: SyncCommand) -> tokio::io::Result<()> {
         match command {
             SyncCommand::RequestFileSync(id) => {
-                if !self.files_sync_status.lock().unwrap().any_active() {
-                    commands_sender.send(SyncCommand::AcceptedFileSync(id))
-                        .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
-                } else {
-                    println!("Denied sync request #{}", id);
-                }
+                self.incoming_sync_requests.lock().unwrap().push_back((commands_sender.clone(), id));
             }
             SyncCommand::AcceptedFileSync(id) => {
                 println!("Got sync request #{}", id);
 
-                let sync = self.sync_requests.lock().unwrap().insert(id);
+                let sync = self.outgoing_sync_requests.lock().unwrap().insert(id);
                 if sync {
                     println!("Requesting sync of files with {}.", destination_address);
 
@@ -303,7 +300,7 @@ impl FileSyncManager {
             }
         }
 
-        self.dispatch_file_block_requests();
+        self.process_queues();
 
         Ok(())
     }
@@ -320,7 +317,7 @@ impl FileSyncManager {
 
             loop {
                 interval.tick().await;
-                file_sync_manager.dispatch_file_block_requests();
+                file_sync_manager.process_queues();
 
                 if let Err(err) = file_sync_manager.delete_log.lock().await.save().await {
                     println!("{:?}", err);
@@ -340,10 +337,18 @@ impl FileSyncManager {
         self.next_sync_request_id.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn dispatch_file_block_requests(&self) {
+    fn process_queues(&self) {
         self.file_block_request_dispatcher.dispatch(|channel_id, filename, _| {
             self.failed_file_sync(channel_id, filename.to_owned());
         });
+
+        if !self.files_sync_status.lock().unwrap().any_active() {
+            while let Some((commands_sender, id)) = self.incoming_sync_requests.lock().unwrap().pop_front() {
+                if let Err(err) = commands_sender.send(SyncCommand::AcceptedFileSync(id)){
+                    println!("{:?}", err);
+                }
+            }
+        }
     }
 
     async fn look_for_file_changes(&self) {
