@@ -7,7 +7,6 @@ use rand::thread_rng;
 
 use crate::tracker::ClientId;
 use crate::filesync::{ChannelId, SyncCommandsSender, SyncCommand};
-use tokio::io::ErrorKind;
 
 pub struct ClientsManager {
     next_commands_channel_id: AtomicU64,
@@ -68,17 +67,7 @@ impl ClientsManager {
         }
     }
 
-    pub fn send_command_random(&self, command: SyncCommand, exclude_channels: &HashSet<ChannelId>) -> tokio::io::Result<()> {
-        for _ in 0..10 {
-            if self.send_command_random_single(command.clone(), &exclude_channels) {
-                return Ok(());
-            }
-        }
-
-        return Err(tokio::io::Error::from(ErrorKind::Other));
-    }
-
-    pub fn send_command_random_single(&self, command: SyncCommand, exclude_channels: &HashSet<ChannelId>) -> bool {
+    pub fn send_command_random(&self, command: SyncCommand, exclude_channels: &HashSet<ChannelId>) -> bool {
         let clients_commands_sender_guard = self.clients_commands_sender.lock().unwrap();
 
         if !clients_commands_sender_guard.is_empty() {
