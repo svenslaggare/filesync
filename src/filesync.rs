@@ -345,8 +345,8 @@ impl FileSyncManager {
     }
 
     fn dispatch_file_block_requests(&self) {
-        self.file_block_request_dispatcher.dispatch(|channel_id, block_request| {
-            self.failed_file_sync(channel_id, block_request.filename);
+        self.file_block_request_dispatcher.dispatch(|channel_id, filename, _| {
+            self.failed_file_sync(channel_id, filename.to_owned());
         });
     }
 
