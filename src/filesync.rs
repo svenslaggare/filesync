@@ -1,13 +1,10 @@
 use std::path::{PathBuf, Path};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet};
 use std::net::SocketAddr;
 use std::sync::{Mutex, Arc};
 use std::iter::FromIterator;
 use std::sync::atomic::{Ordering, AtomicU64};
 use std::ops::Deref;
-
-use rand::{thread_rng};
-use rand::seq::SliceRandom;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::net::TcpStream;
@@ -20,6 +17,7 @@ use crate::{files, sync};
 use crate::sync::{SyncAction, FileChangesFinder, DeleteLog};
 use crate::tracker::ClientId;
 use crate::sync_engine::{FilesSyncStatus, FileBlockRequestDispatcher};
+use crate::sync_clients::ClientsManager;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
@@ -88,8 +86,7 @@ impl std::fmt::Debug for ChannelId {
 
 pub struct FileSyncManager {
     folder: PathBuf,
-    next_commands_channel_id: AtomicU64,
-    clients_commands_sender: Mutex<HashMap<ClientId, (ChannelId, SyncCommandsSender)>>,
+    clients_manager: ClientsManager,
     file_changes_finder: Mutex<FileChangesFinder>,
     delete_log: tokio::sync::Mutex<DeleteLog>,
     files_sync_status: Mutex<FilesSyncStatus>,
@@ -102,8 +99,7 @@ impl FileSyncManager {
     pub fn new(folder: PathBuf) -> FileSyncManager {
         FileSyncManager {
             folder: folder.clone(),
-            clients_commands_sender: Mutex::new(HashMap::new()),
-            next_commands_channel_id: AtomicU64::new(1),
+            clients_manager: ClientsManager::new(),
             file_changes_finder: Mutex::new(FileChangesFinder::new()),
             delete_log:  tokio::sync::Mutex::new(DeleteLog::new(folder.clone())),
             files_sync_status: Mutex::new(FilesSyncStatus::new()),
@@ -280,7 +276,7 @@ impl FileSyncManager {
 
                         self.received_file_block(channel_id, &filename, &block, content.len());
                         if self.try_complete_file_sync(&filename, modified).await? {
-                            self.send_commands_all(SyncCommand::SendFile(filename, modified));
+                            self.clients_manager.send_commands_all(SyncCommand::SendFile(filename, modified));
                         }
                     }
                 } else {
@@ -372,7 +368,7 @@ impl FileSyncManager {
                 let filename = deleted_file.path.to_str().unwrap().to_owned();
                 println!("Deleted file '{}'", filename);
                 delete_log_guard.add_entry(&filename, deleted_file.modified);
-                self.send_commands_all(SyncCommand::DeleteFile(filename, deleted_file.modified));
+                self.clients_manager.send_commands_all(SyncCommand::DeleteFile(filename, deleted_file.modified));
             }
         }
     }
@@ -421,9 +417,9 @@ impl FileSyncManager {
     async fn start_file_sync_all(&self, filename: String, subset: bool) {
         if let Ok(command) = files::start_file_sync(&self.folder, filename, true).await {
             if subset {
-                self.send_commands_random_subset(command);
+                self.clients_manager.send_commands_random_subset(command);
             } else {
-                self.send_commands_all(command);
+                self.clients_manager.send_commands_all(command);
             }
         }
     }
@@ -435,7 +431,7 @@ impl FileSyncManager {
                             exclude_channels: &HashSet<ChannelId>) -> tokio::io::Result<()> {
         let command = SyncCommand::GetFile(filename, modified, redistribute);
         for _ in 0..10 {
-            if self.send_command_random(command.clone(), &exclude_channels) {
+            if self.clients_manager.send_command_random(command.clone(), &exclude_channels) {
                 return Ok(());
             }
         }
@@ -459,15 +455,15 @@ impl FileSyncManager {
     }
 
     pub fn next_commands_channel_id(&self) -> ChannelId {
-        ChannelId(self.next_commands_channel_id.fetch_add(1, Ordering::SeqCst))
+        self.clients_manager.next_commands_channel_id()
     }
 
     pub fn add_client(&self, client_id: ClientId, channel_id: ChannelId, commands_sender: SyncCommandsSender) {
-        self.clients_commands_sender.lock().unwrap().insert(client_id, (channel_id, commands_sender));
+        self.clients_manager.add_client(client_id, channel_id, commands_sender);
     }
 
     pub fn remove_client(&self, client_id: ClientId) {
-        self.clients_commands_sender.lock().unwrap().remove(&client_id);
+        self.clients_manager.remove_client(client_id);
     }
 
     pub fn remove_active_requests(&self, channel_id: ChannelId) {
@@ -475,62 +471,6 @@ impl FileSyncManager {
             for request in requests {
                 self.failed_file_sync(channel_id, request.0);
             }
-        }
-    }
-
-    pub fn send_commands_all(&self, command: SyncCommand) {
-        for (_, commands_sender) in self.clients_commands_sender.lock().unwrap().values() {
-            if let Err(err) = commands_sender.send(command.clone()) {
-                println!("{:?}", err);
-            }
-        }
-    }
-
-    pub fn send_commands_random_subset(&self, command: SyncCommand) -> usize {
-        let clients_commands_sender_guard = self.clients_commands_sender.lock().unwrap();
-
-        if !clients_commands_sender_guard.is_empty() {
-            let mut keys = clients_commands_sender_guard.keys().collect::<Vec<_>>();
-            keys.shuffle(&mut thread_rng());
-            // let count = thread_rng().gen_range(1..(keys.len() + 1));
-            let count = 1;
-
-            let mut used_count = 0;
-            for client in &keys {
-                if clients_commands_sender_guard[*client].1.send(command.clone()).is_ok() {
-                    used_count += 1;
-                }
-
-                if used_count >= count {
-                    break;
-                }
-            }
-
-            used_count
-        } else {
-            0
-        }
-    }
-
-    pub fn send_command_random(&self, command: SyncCommand, exclude_channels: &HashSet<ChannelId>) -> bool {
-        let clients_commands_sender_guard = self.clients_commands_sender.lock().unwrap();
-
-        if !clients_commands_sender_guard.is_empty() {
-            let mut keys = clients_commands_sender_guard.keys().collect::<Vec<_>>();
-            keys.shuffle(&mut thread_rng());
-
-            for key in keys {
-                let (channel_id, commands_sender) = &clients_commands_sender_guard[key];
-                if !exclude_channels.contains(channel_id) {
-                    if commands_sender.send(command.clone()).is_ok() {
-                        return true;
-                    }
-                }
-            }
-
-            false
-        } else {
-            false
         }
     }
 }
