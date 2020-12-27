@@ -186,6 +186,7 @@ pub async fn start_file_sync(folder: &Path, filename: String, redistribute: bool
 
 pub async fn send_file_block(folder: &Path,
                              filename: String,
+                             modified: ModifiedTime,
                              file_block: &FileBlock) -> tokio::io::Result<SyncCommand> {
     let path = folder.join(&filename);
     let mut file = tokio::fs::OpenOptions::new()
@@ -206,6 +207,7 @@ pub async fn send_file_block(folder: &Path,
     Ok(
         SyncCommand::FileBlock {
             filename: filename.clone(),
+            modified,
             block: file_block.clone(),
             hash,
             content: buffer

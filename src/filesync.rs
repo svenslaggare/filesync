@@ -28,8 +28,8 @@ pub enum SyncCommand {
     GetFileDenied(String, ModifiedTime, bool),
     SendFile(String, ModifiedTime),
     StartSyncFile { filename: String, request: FileRequest, redistribute: bool },
-    GetFileBlock { filename: String, block: FileBlock },
-    FileBlock { filename: String, block: FileBlock, hash: String, content: Vec<u8> },
+    GetFileBlock { filename: String, modified: ModifiedTime, block: FileBlock },
+    FileBlock { filename: String, modified: ModifiedTime, block: FileBlock, hash: String, content: Vec<u8> },
     DeleteFile(String, ModifiedTime)
 }
 
@@ -223,13 +223,26 @@ impl FileSyncManager {
             },
             SyncCommand::StartSyncFile { filename, request, redistribute } => {
                 if files::is_remote_newer(&self.folder.join(&filename), &request.modified).await {
-                    if !self.files_sync_status.lock().unwrap().is_syncing(&filename) {
+                    let start_sync = if !self.files_sync_status.lock().unwrap().is_syncing(&filename) {
+                        true
+                    } else if self.files_sync_status.lock().unwrap().is_newer(&filename, request.modified) {
+                        self.files_sync_status.lock().unwrap().remove_success(&filename);
+                        self.file_block_request_dispatcher.remove_file(&filename);
+                        true
+                    } else {
+                        println!("Sync request for file {} is already ongoing.", filename);
+                        false
+                    };
+
+                    if start_sync {
                         println!(
                             "Starting sync of file: {} ({} bytes), redistribute: {}",
                             filename,
                             request.size,
                             redistribute
                         );
+
+                        let modified = request.modified;
 
                         let blocks = self.files_sync_status.lock().unwrap().add(
                             &self.folder,
@@ -242,41 +255,61 @@ impl FileSyncManager {
                             channel_id,
                             commands_sender.clone(),
                             filename,
+                            modified,
                             blocks
                         );
-                    } else {
-                        println!("Sync request for file {} is already ongoing.", filename);
                     }
                 } else {
                     println!("Sync request for file {} is older than what we have locally.", filename);
                 }
             }
-            SyncCommand::GetFileBlock { filename, block } => {
-                commands_sender.send(files::send_file_block(
+            SyncCommand::GetFileBlock { filename, modified, block } => {
+                let command = files::send_file_block(
                     &self.folder,
                     filename,
+                    modified,
                     &block
-                ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                ).await;
+
+                match command {
+                    Ok(command) => {
+                        commands_sender.send(command)
+                            .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                    }
+                    Err(err) => {
+                        println!("Failed to read block due to: {}", err)
+                    }
+                }
             }
-            SyncCommand::FileBlock { filename, block, hash, content } => {
+            SyncCommand::FileBlock { filename, modified: block_modified, block, hash, content } => {
                 let actual_hash = hash_file_block(block.offset(), &content);
 
                 if actual_hash == hash {
                     let result = self.files_sync_status.lock().unwrap().get_tmp_write_path(&filename);
-                    if let Some((tmp_path, modified)) = result {
-                        files::write_file_block(
-                            &tmp_path,
-                            &block,
-                            modified,
-                            &content,
-                        ).await?;
+                    if let Some((tmp_path, file_modified)) = result {
+                        if file_modified == block_modified {
+                            files::write_file_block(
+                                &tmp_path,
+                                &block,
+                                file_modified,
+                                &content,
+                            ).await?;
 
-                        self.received_file_block(channel_id, &filename, &block, content.len());
-                        if self.try_complete_file_sync(&filename, modified).await? {
-                            self.clients_manager.send_commands_all(SyncCommand::SendFile(filename, modified));
+                            self.received_file_block(channel_id, &filename, &block, content.len());
+                            if self.try_complete_file_sync(&filename, file_modified).await? {
+                                self.clients_manager.send_commands_all(SyncCommand::SendFile(filename, file_modified));
+                            }
+                        } else {
+                            println!(
+                                "Got modified {} for {}/{} but expected {}",
+                                block_modified,
+                                filename,
+                                block.number,
+                                file_modified
+                            );
                         }
                     }
-                } else {
+                } else if let Some(file_sync_status) = self.files_sync_status.lock().unwrap().get(&filename) {
                     println!(
                         "Receive error for file block: {}/{}: expected hash {} but got {}.",
                         filename,
@@ -287,6 +320,7 @@ impl FileSyncManager {
 
                     commands_sender.send(SyncCommand::GetFileBlock {
                         filename,
+                        modified: file_sync_status.request.modified,
                         block,
                     }).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 }

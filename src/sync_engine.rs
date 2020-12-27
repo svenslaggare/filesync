@@ -104,6 +104,10 @@ impl FilesSyncStatus {
         }
     }
 
+    pub fn get(&mut self, filename: &str) -> Option<&FileSyncStatus> {
+        self.files.get(filename)
+    }
+
     pub fn get_mut(&mut self, filename: &str) -> Option<&mut FileSyncStatus> {
         self.files.get_mut(filename)
     }
@@ -116,6 +120,12 @@ impl FilesSyncStatus {
         self.files.contains_key(filename)
     }
 
+    pub fn is_newer(&self, filename: &str, modified: ModifiedTime) -> bool {
+        self.files.get(filename)
+            .map(|file_sync_status| modified.is_newer(&file_sync_status.request.modified))
+            .unwrap_or(false)
+    }
+
     pub fn is_done(&self, filename: &str) -> bool {
         self.files.get(filename).map(|file| file.is_done()).unwrap_or(false)
     }
@@ -124,6 +134,7 @@ impl FilesSyncStatus {
 struct FileBlocksRequest {
     pub commands_sender: SyncCommandsSender,
     pub filename: String,
+    pub modified: ModifiedTime,
     pub blocks: VecDeque<FileBlock>
 }
 
@@ -153,6 +164,7 @@ impl FileBlockRequestDispatcher {
                         any_left = true;
                         let command = SyncCommand::GetFileBlock {
                             filename: file_request.filename.clone(),
+                            modified: file_request.modified,
                             block: block.clone()
                         };
 
@@ -203,12 +215,14 @@ impl FileBlockRequestDispatcher {
                    channel_id: ChannelId,
                    commands_sender: SyncCommandsSender,
                    filename: String,
+                   modified: ModifiedTime,
                    blocks: Vec<FileBlock>) {
         let mut request_queue_guard = self.queue.lock().unwrap();
         let channel_request_queue = request_queue_guard.entry(channel_id).or_insert_with(|| VecDeque::new());
         channel_request_queue.push_back(FileBlocksRequest {
             commands_sender,
             filename,
+            modified,
             blocks: VecDeque::from(blocks)
         });
     }
@@ -227,5 +241,12 @@ impl FileBlockRequestDispatcher {
         }
 
         active_requests
+    }
+
+    pub fn remove_file(&self, filename: &str) {
+        let mut request_queue_guard = self.queue.lock().unwrap();
+        for channel_queue in request_queue_guard.values_mut() {
+            channel_queue.retain(|file| file.filename != filename);
+        }
     }
 }
