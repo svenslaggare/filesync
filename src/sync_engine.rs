@@ -124,7 +124,7 @@ impl FilePeersDiscovery {
             }
         }
 
-        self.files.retain(|_, file_peers| !(file_peers.peers.is_empty() && file_peers.alive_seconds() >= 30.0));
+        self.files.retain(|_, file_peers| !(file_peers.peers.is_empty() && file_peers.alive_seconds() >= 60.0));
 
         for (filename, file_peers) in self.files.iter_mut() {
             if file_peers.poll_seconds().map(|poll_time| poll_time >= 1.0).unwrap_or(true) {
