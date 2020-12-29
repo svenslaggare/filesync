@@ -5,9 +5,134 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
+use rand::seq::SliceRandom;
+
+use serde::{Serialize, Deserialize};
 
 use crate::files::{FileRequest, ModifiedTime, FileBlock};
 use crate::filesync::{ChannelId, SyncCommandsSender, SyncCommand};
+use crate::tracker::ClientId;
+use crate::sync_clients::PeersManager;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileSyncRequest {
+    pub filename: String,
+    pub modified: ModifiedTime,
+    pub redistribute: bool
+}
+
+struct FilePeers {
+    request: FileSyncRequest,
+    created: std::time::Instant,
+    last_poll: Option<std::time::Instant>,
+    peers: Vec<(ClientId, i32)>
+}
+
+impl FilePeers {
+    pub fn new(request: FileSyncRequest) -> FilePeers {
+        FilePeers {
+            request,
+            created: std::time::Instant::now(),
+            last_poll: None,
+            peers: Vec::new()
+        }
+    }
+
+    pub fn alive_seconds(&self) -> f64 {
+        (std::time::Instant::now() - self.created).as_secs_f64()
+    }
+
+    pub fn poll_seconds(&self) -> Option<f64> {
+        self.last_poll.map(|last_poll| (std::time::Instant::now() - last_poll).as_secs_f64())
+    }
+}
+
+pub struct FilePeersDiscovery {
+    files: HashMap<String, FilePeers>
+}
+
+impl FilePeersDiscovery {
+    pub fn new() -> FilePeersDiscovery {
+        FilePeersDiscovery {
+            files: HashMap::new()
+        }
+    }
+
+    pub fn add_file(&mut self, request: FileSyncRequest) {
+        self.files.insert(
+            request.filename.clone(),
+            FilePeers::new(request)
+        );
+    }
+
+    pub fn send_discover(&mut self, filename: &str, clients: &PeersManager) {
+        if let Some(file_peers) = self.files.get_mut(filename) {
+            FilePeersDiscovery::send_discover_internal(filename, file_peers, clients);
+        }
+    }
+
+    fn send_discover_internal(filename: &str, file_peers: &mut FilePeers, clients: &PeersManager) {
+        file_peers.peers.clear();
+        file_peers.last_poll = Some(std::time::Instant::now());
+        clients.send_commands_all(SyncCommand::GotFileRequest(filename.to_owned(), file_peers.request.modified));
+    }
+
+    pub fn add_file_peer(&mut self, filename: &str, client_id: ClientId, availability: i32) {
+        if let Some(file_peer) = self.files.get_mut(filename) {
+            file_peer.peers.push((client_id, availability));
+        }
+    }
+
+    pub fn try_select_file_peer(&mut self, filename: &str) -> Option<(ClientId, FileSyncRequest)> {
+        if let Some(file_peers) = self.files.get(filename) {
+            if !file_peers.peers.is_empty() {
+                let mut peers = file_peers.peers.clone();
+                let mut rng = thread_rng();
+
+                peers.shuffle(&mut rng);
+
+                for peer in &mut peers {
+                    if peer.1 != 0 {
+                        peer.1 += rng.gen_range(0..3);
+                    }
+                }
+
+                let file_peers = self.files.remove(filename).unwrap();
+
+                peers.sort_by_key(|peer| -peer.1);
+                peers.first().map(|c| (c.0, file_peers.request))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn update(&mut self, peers: &PeersManager) {
+        let filenames = self.files.keys().cloned().collect::<Vec<_>>();
+        for filename in filenames {
+            if let Some((client_id, request)) = self.try_select_file_peer(&filename) {
+                let sent = peers.send_commands_to(
+                    client_id,
+                    SyncCommand::GetFile(request.clone())
+                ).is_ok();
+
+                if !sent {
+                    self.add_file(request);
+                }
+            }
+        }
+
+        self.files.retain(|_, file_peers| !(file_peers.peers.is_empty() && file_peers.alive_seconds() >= 30.0));
+
+        for (filename, file_peers) in self.files.iter_mut() {
+            if file_peers.poll_seconds().map(|poll_time| poll_time >= 1.0).unwrap_or(true) {
+                FilePeersDiscovery::send_discover_internal(filename, file_peers, peers);
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct FileSyncStatus {

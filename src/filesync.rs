@@ -1,8 +1,7 @@
 use std::path::{PathBuf, Path};
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Mutex, Arc};
-use std::iter::FromIterator;
+use std::sync::{Mutex, Arc, RwLock};
 use std::sync::atomic::{Ordering, AtomicU64};
 use std::ops::Deref;
 
@@ -16,17 +15,19 @@ use crate::files::{FileBlock, File, FileRequest, hash_file_block, ModifiedTime};
 use crate::{files, sync};
 use crate::sync::{SyncAction, FileChangesFinder, DeleteLog};
 use crate::tracker::ClientId;
-use crate::sync_engine::{FilesSyncStatus, FileBlockRequestDispatcher};
-use crate::sync_clients::ClientsManager;
+use crate::sync_engine::{FilesSyncStatus, FileBlockRequestDispatcher, FilePeersDiscovery, FileSyncRequest};
+use crate::sync_clients::PeersManager;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SyncCommand {
     RequestFileSync(u64),
     AcceptedFileSync(u64),
     SyncFiles(Vec<(String, ModifiedTime)>),
-    GetFile(String, ModifiedTime, bool),
-    GetFileDenied(String, ModifiedTime, bool),
+    GetFile(FileSyncRequest),
+    GetFileDenied(FileSyncRequest),
     SendFile(String, ModifiedTime),
+    GotFileRequest(String, ModifiedTime),
+    GotFileResponse { client_id: ClientId, filename: String, have_file: bool, availability: i32 },
     StartSyncFile { filename: String, request: FileRequest, redistribute: bool },
     GetFileBlock { filename: String, modified: ModifiedTime, block: FileBlock },
     FileBlock { filename: String, modified: ModifiedTime, block: FileBlock, hash: String, content: Vec<u8> },
@@ -55,9 +56,11 @@ impl std::fmt::Display for SyncCommand {
             SyncCommand::RequestFileSync(_) => write!(f, "RequestFileSync"),
             SyncCommand::AcceptedFileSync(_) => write!(f, "AcceptedFileSync"),
             SyncCommand::SyncFiles(_) => write!(f, "SyncFiles"),
-            SyncCommand::GetFile(_, _, _) => write!(f, "GetFile"),
-            SyncCommand::GetFileDenied(_, _, _) => write!(f, "GetFileDenied"),
+            SyncCommand::GetFile(_) => write!(f, "GetFile"),
+            SyncCommand::GetFileDenied(_) => write!(f, "GetFileDenied"),
             SyncCommand::SendFile(_, _) => write!(f, "SendFile"),
+            SyncCommand::GotFileRequest(_, _) => write!(f, "GotFileRequest"),
+            SyncCommand::GotFileResponse { .. } => write!(f, "GotFileResponse"),
             SyncCommand::StartSyncFile { .. } => write!(f, "StartSyncFile"),
             SyncCommand::GetFileBlock { .. } => write!(f, "GetFileBlock"),
             SyncCommand::FileBlock { .. } => write!(f, "FileBlock"),
@@ -86,10 +89,12 @@ impl std::fmt::Debug for ChannelId {
 
 pub struct FileSyncManager {
     folder: PathBuf,
-    clients_manager: ClientsManager,
+    client_id: RwLock<Option<ClientId>>,
+    peers_manager: PeersManager,
     file_changes_finder: Mutex<FileChangesFinder>,
     delete_log: tokio::sync::Mutex<DeleteLog>,
     files_sync_status: Mutex<FilesSyncStatus>,
+    file_peers_discovery: Mutex<FilePeersDiscovery>,
     file_block_request_dispatcher: FileBlockRequestDispatcher,
     next_sync_request_id: AtomicU64,
     outgoing_sync_requests: Mutex<HashSet<u64>>,
@@ -100,15 +105,25 @@ impl FileSyncManager {
     pub fn new(folder: PathBuf) -> FileSyncManager {
         FileSyncManager {
             folder: folder.clone(),
-            clients_manager: ClientsManager::new(),
+            client_id: RwLock::new(None),
+            peers_manager: PeersManager::new(),
             file_changes_finder: Mutex::new(FileChangesFinder::new()),
-            delete_log:  tokio::sync::Mutex::new(DeleteLog::new(folder.clone())),
+            delete_log: tokio::sync::Mutex::new(DeleteLog::new(folder.clone())),
+            file_peers_discovery: Mutex::new(FilePeersDiscovery::new()),
             files_sync_status: Mutex::new(FilesSyncStatus::new()),
             file_block_request_dispatcher: FileBlockRequestDispatcher::new(),
             next_sync_request_id: AtomicU64::new(1),
             outgoing_sync_requests: Mutex::new(HashSet::new()),
             incoming_sync_requests: Mutex::new(VecDeque::new())
         }
+    }
+
+    pub fn client_id(&self) -> Option<ClientId> {
+        *self.client_id.read().unwrap()
+    }
+
+    pub fn set_client_id(&self, client_id: ClientId) {
+        *self.client_id.write().unwrap() = Some(client_id);
     }
 
     pub async fn run(&self,
@@ -186,7 +201,7 @@ impl FileSyncManager {
                     let command = match action {
                         SyncAction::GetFile(filename, modified) => {
                             println!("Get file: {}", filename);
-                            SyncCommand::GetFile(filename, modified, true)
+                            SyncCommand::GetFile(FileSyncRequest { filename, modified, redistribute: true })
                         }
                         SyncAction::SendFile(filename, modified) => {
                             println!("Sending file: {}", filename);
@@ -202,25 +217,47 @@ impl FileSyncManager {
                         .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 }
             }
-            SyncCommand::GetFile(filename, modified, redistribute) => {
-                if files::has_file(&self.folder.join(&filename), &modified).await {
+            SyncCommand::GetFile(request) => {
+                if files::has_file(&self.folder.join(&request.filename), &request.modified).await {
                     commands_sender.send(files::start_file_sync(
                         &self.folder,
-                        filename,
-                        redistribute
+                        request.filename,
+                        request.redistribute
                     ).await?).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 } else {
-                    println!("Don't got file {} @ {}", filename, modified.to_unix_seconds());
-                    commands_sender.send(SyncCommand::GetFileDenied(filename, modified, redistribute))
+                    println!("Don't got file {} @ {}", request.filename, request.modified.to_unix_seconds());
+                    commands_sender.send(SyncCommand::GetFileDenied(request))
                         .map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
                 }
             }
-            SyncCommand::GetFileDenied(filename, modified, redistribute) => {
-                self.get_file_from_random(filename, modified, redistribute, &HashSet::new())?;
+            SyncCommand::GetFileDenied(request) => {
+                self.discover_file_peers(request);
             },
             SyncCommand::SendFile(filename, modified) => {
-                self.get_file_from_random(filename, modified, false, &HashSet::new())?;
+                self.discover_file_peers(
+                    FileSyncRequest {
+                        filename,
+                        modified,
+                        redistribute: false
+                    }
+                );
             },
+            SyncCommand::GotFileRequest(filename, modified) => {
+                if let Some(client_id) = self.client_id() {
+                    let have_file = files::has_file(&self.folder.join(&filename), &modified).await;
+                    commands_sender.send(SyncCommand::GotFileResponse {
+                        client_id,
+                        filename: filename.clone(),
+                        have_file,
+                        availability: if have_file {10} else {0}
+                    }).map_err(|_| tokio::io::Error::from(ErrorKind::Other))?;
+                }
+            }
+            SyncCommand::GotFileResponse { client_id, filename, have_file, availability } => {
+                if have_file {
+                    self.file_peers_discovery.lock().unwrap().add_file_peer(&filename, client_id, availability);
+                }
+            }
             SyncCommand::StartSyncFile { filename, request, redistribute } => {
                 if files::is_remote_newer(&self.folder.join(&filename), &request.modified).await {
                     let start_sync = if !self.files_sync_status.lock().unwrap().is_syncing(&filename) {
@@ -297,7 +334,7 @@ impl FileSyncManager {
 
                             self.received_file_block(channel_id, &filename, &block, content.len());
                             if self.try_complete_file_sync(&filename, file_modified).await? {
-                                self.clients_manager.send_commands_all(SyncCommand::SendFile(filename, file_modified));
+                                self.peers_manager.send_commands_all(SyncCommand::SendFile(filename, file_modified));
                             }
                         } else {
                             println!(
@@ -347,7 +384,7 @@ impl FileSyncManager {
 
         let file_sync_manager = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
             loop {
                 interval.tick().await;
@@ -372,6 +409,8 @@ impl FileSyncManager {
     }
 
     fn process_queues(&self) {
+        self.file_peers_discovery.lock().unwrap().update(&self.peers_manager);
+
         self.file_block_request_dispatcher.dispatch(|channel_id, filename, _| {
             self.failed_file_sync(channel_id, filename.to_owned());
         });
@@ -407,7 +446,7 @@ impl FileSyncManager {
                 let filename = deleted_file.path.to_str().unwrap().to_owned();
                 println!("Deleted file '{}'", filename);
                 delete_log_guard.add_entry(&filename, deleted_file.modified);
-                self.clients_manager.send_commands_all(SyncCommand::DeleteFile(filename, deleted_file.modified));
+                self.peers_manager.send_commands_all(SyncCommand::DeleteFile(filename, deleted_file.modified));
             }
         }
     }
@@ -456,55 +495,41 @@ impl FileSyncManager {
     async fn start_file_sync_all(&self, filename: String, subset: bool) {
         if let Ok(command) = files::start_file_sync(&self.folder, filename, true).await {
             if subset {
-                self.clients_manager.send_commands_random_subset(command);
+                self.peers_manager.send_commands_random_subset(command);
             } else {
-                self.clients_manager.send_commands_all(command);
+                self.peers_manager.send_commands_all(command);
             }
         }
     }
 
-    fn get_file_from_random(&self,
-                            filename: String,
-                            modified: ModifiedTime,
-                            redistribute: bool,
-                            exclude_channels: &HashSet<ChannelId>) -> tokio::io::Result<()> {
-        let result = self.clients_manager.send_command_random(
-            SyncCommand::GetFile(filename, modified, redistribute),
-            exclude_channels
-        );
-
-        if result {
-            Ok(())
-        } else {
-            Err(tokio::io::Error::from(ErrorKind::Other))
-        }
+    fn discover_file_peers(&self, request: FileSyncRequest) {
+        self.file_peers_discovery.lock().unwrap().add_file(request);
     }
 
-    fn failed_file_sync(&self, channel_id: ChannelId, filename: String) {
+    fn failed_file_sync(&self, _channel_id: ChannelId, filename: String) {
         if let Some(file_sync_status) = self.files_sync_status.lock().unwrap().remove_failed(&filename) {
             println!("Failed to sync file '{}'.", filename);
 
-            #[allow(unused_must_use)] {
-                self.get_file_from_random(
+            self.discover_file_peers(
+                FileSyncRequest {
                     filename,
-                    file_sync_status.request.modified,
-                    file_sync_status.redistribute,
-                    &hashset![channel_id]
-                );
-            }
+                    modified: file_sync_status.request.modified,
+                    redistribute: file_sync_status.redistribute,
+                }
+            );
         }
     }
 
     pub fn next_commands_channel_id(&self) -> ChannelId {
-        self.clients_manager.next_commands_channel_id()
+        self.peers_manager.next_commands_channel_id()
     }
 
     pub fn add_client(&self, client_id: ClientId, channel_id: ChannelId, commands_sender: SyncCommandsSender) {
-        self.clients_manager.add_client(client_id, channel_id, commands_sender);
+        self.peers_manager.add_peer(client_id, channel_id, commands_sender);
     }
 
     pub fn remove_client(&self, client_id: ClientId) {
-        self.clients_manager.remove_client(client_id);
+        self.peers_manager.remove_peer(client_id);
     }
 
     pub fn remove_active_requests(&self, channel_id: ChannelId) {

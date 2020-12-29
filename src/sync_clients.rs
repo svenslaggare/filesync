@@ -5,18 +5,20 @@ use std::collections::{HashMap, HashSet};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 
+use tokio::io::ErrorKind;
+
 use crate::tracker::ClientId;
 use crate::filesync::{ChannelId, SyncCommandsSender, SyncCommand};
 
-pub struct ClientsManager {
+pub struct PeersManager {
     next_commands_channel_id: AtomicU64,
-    clients_commands_sender: Mutex<HashMap<ClientId, (ChannelId, SyncCommandsSender)>>,
+    peers: Mutex<HashMap<ClientId, (ChannelId, SyncCommandsSender)>>,
 }
 
-impl ClientsManager {
-    pub fn new() -> ClientsManager {
-        ClientsManager {
-            clients_commands_sender: Mutex::new(HashMap::new()),
+impl PeersManager {
+    pub fn new() -> PeersManager {
+        PeersManager {
+            peers: Mutex::new(HashMap::new()),
             next_commands_channel_id: AtomicU64::new(1),
         }
     }
@@ -25,24 +27,32 @@ impl ClientsManager {
         ChannelId(self.next_commands_channel_id.fetch_add(1, Ordering::SeqCst))
     }
 
-    pub fn add_client(&self, client_id: ClientId, channel_id: ChannelId, commands_sender: SyncCommandsSender) {
-        self.clients_commands_sender.lock().unwrap().insert(client_id, (channel_id, commands_sender));
+    pub fn add_peer(&self, client_id: ClientId, channel_id: ChannelId, commands_sender: SyncCommandsSender) {
+        self.peers.lock().unwrap().insert(client_id, (channel_id, commands_sender));
     }
 
-    pub fn remove_client(&self, client_id: ClientId) {
-        self.clients_commands_sender.lock().unwrap().remove(&client_id);
+    pub fn remove_peer(&self, client_id: ClientId) {
+        self.peers.lock().unwrap().remove(&client_id);
     }
 
     pub fn send_commands_all(&self, command: SyncCommand) {
-        for (_, commands_sender) in self.clients_commands_sender.lock().unwrap().values() {
+        for (_, commands_sender) in self.peers.lock().unwrap().values() {
             if let Err(err) = commands_sender.send(command.clone()) {
                 println!("{:?}", err);
             }
         }
     }
 
+    pub fn send_commands_to(&self, client_id: ClientId, command: SyncCommand) -> tokio::io::Result<()> {
+        if let Some(client) = self.peers.lock().unwrap().get(&client_id) {
+            client.1.send(command).map_err(|_| tokio::io::Error::from(ErrorKind::Other))
+        } else {
+            Err(tokio::io::Error::from(ErrorKind::Other))
+        }
+    }
+
     pub fn send_commands_random_subset(&self, command: SyncCommand) -> usize {
-        let clients_commands_sender_guard = self.clients_commands_sender.lock().unwrap();
+        let clients_commands_sender_guard = self.peers.lock().unwrap();
 
         if !clients_commands_sender_guard.is_empty() {
             let mut keys = clients_commands_sender_guard.keys().collect::<Vec<_>>();
@@ -68,7 +78,7 @@ impl ClientsManager {
     }
 
     pub fn send_command_random(&self, command: SyncCommand, exclude_channels: &HashSet<ChannelId>) -> bool {
-        let clients_commands_sender_guard = self.clients_commands_sender.lock().unwrap();
+        let clients_commands_sender_guard = self.peers.lock().unwrap();
 
         if !clients_commands_sender_guard.is_empty() {
             let mut keys = clients_commands_sender_guard.keys().collect::<Vec<_>>();

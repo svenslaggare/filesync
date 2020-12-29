@@ -180,7 +180,9 @@ pub async fn run_client(tracker_address: SocketAddr,
 
         match command {
             TrackerCommand::Connect(_) => { eprintln!("Unexpected."); }
-            TrackerCommand::ConnectionInfo { id: _, clients } => {
+            TrackerCommand::ConnectionInfo { id, clients } => {
+                file_sync_manager.set_client_id(id);
+
                 for client in clients {
                     if let Err(err) = start_sync_client(client, file_sync_manager.clone(), true).await {
                         println!("Sync client error: {:?}", err);
